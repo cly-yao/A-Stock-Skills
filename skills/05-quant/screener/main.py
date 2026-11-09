@@ -422,6 +422,32 @@ def _fetch_live_quotes(scope: Optional[List[str]], universe_limit: int, timeout:
         except Exception as exc:
             meta["errors"].append(f"eastmoney_ulist: {exc}")
             symbols = ",".join(astock_runtime.sina_symbol(code) for code in scope)
+            try:
+                response = astock_runtime.http_get(
+                    astock_runtime.TENCENT_QT_URL + symbols,
+                    timeout=timeout,
+                    encoding="gbk",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                response.raise_for_status()
+                rows = astock_runtime.parse_tencent_quotes(response.text, include_fundamentals=True)
+                if rows:
+                    frame = pd.DataFrame(rows)
+                    got = set(frame["code"].tolist())
+                    meta["missing"] = [code for code in scope if code not in got]
+                    meta["source"] = "tencent_qt"
+                    meta["fallback"] = True
+                    meta["universe_complete"] = not meta["missing"]
+                    meta["fetch_invocations"] = 2
+                    meta["note"] = (
+                        "东财 ulist 失败，改用腾讯 qt.gtimg.cn。"
+                        "pe 是字段 52（与东财动态市盈率对齐过），不是字段 39。"
+                        "total_mv 为亿元。没有的代码不补价。"
+                    )
+                    return frame
+                meta["errors"].append("tencent_qt: 没有解析出行")
+            except Exception as exc2:
+                meta["errors"].append(f"tencent_qt: {type(exc2).__name__}: {exc2}")
             response = astock_runtime.http_get(
                 astock_runtime.SINA_HQ_URL + symbols,
                 timeout=timeout,
@@ -436,9 +462,9 @@ def _fetch_live_quotes(scope: Optional[List[str]], universe_limit: int, timeout:
             meta["source"] = "sina_hq"
             meta["fallback"] = True
             meta["universe_complete"] = not meta["missing"]
-            meta["fetch_invocations"] = 2
+            meta["fetch_invocations"] = 3
             meta["note"] = (
-                "东财批量行情失败，改用新浪个股行情。"
+                "东财 ulist 和腾讯 qt 都没有给出可用行情，改用新浪个股行情。"
                 "该源没有 PE/PB/总市值，这些字段保持为空，不会用估算值填上。"
             )
             return frame
@@ -772,8 +798,12 @@ def main(argv=None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     else:
         _print_table(result)
-    if payload["errors"] and payload["row_count"] == 0:
+    if payload.get("not_evaluated") and payload["row_count"] == 0:
         return 1
+    if payload["errors"] and payload["row_count"] == 0 and not payload.get("filtered_out"):
+        return 1
+    if payload.get("not_evaluated"):
+        return 3
     return 0
 
 

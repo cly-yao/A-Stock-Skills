@@ -98,8 +98,10 @@ def test_daily_synthetic_transport_is_bounded_and_labeled():
     breadth = next(section for section in built["sections"] if section["id"] == "breadth")
     assert breadth["up"] == 3 and breadth["down"] == 4 and breadth["flat"] == 1
     limit_up = next(section for section in built["sections"] if section["id"] == "limit_up")
-    assert limit_up["status"] == "partial"
+    assert limit_up["status"] == "ok"
     assert limit_up["total"] == 10
+    assert "date" in transport.calls[-1]["params"]
+    assert report._exit_code(built) == 3
     assert "p_raw" in text
 
 
@@ -133,6 +135,7 @@ def test_stock_report_uses_one_quote_and_computes_ma_from_fixture_bars():
     assert technical["rows"][0]["ma5"] == pytest.approx(18)
     assert technical["rows"][0]["ma20"] == pytest.approx(10.5)
     assert "stock_zh_a_spot" not in text
+    assert report._exit_code(built) == 3
 
 
 def test_failed_sections_do_not_render_zero_prices():
@@ -141,7 +144,9 @@ def test_failed_sections_do_not_render_zero_prices():
             return FakeResponse(text="")
         return FakeResponse(payload={"data": {}})
 
-    built = report.build_stock_report("600519", transport=FakeTransport(empty), provenance="synthetic")
+    built = report.build_stock_report(
+        "600519", transport=FakeTransport(empty, max_calls=8), provenance="synthetic"
+    )
     text = report.render_markdown(built)
     assert all(section["status"] == "failed" for section in built["sections"])
     assert "现价:" not in text
@@ -167,6 +172,7 @@ def test_portfolio_omits_missing_quotes_from_the_total():
     )
     section = built["sections"][0]
     assert section["status"] == "partial"
+    assert report._exit_code(built) == 3
     assert section["missing"] == ["000001"]
     text = report.render_markdown(built)
     assert "计入合计的持仓: 1 只" in text

@@ -132,6 +132,70 @@ def test_limit_up_signal_uses_previous_close_not_a_constant():
     assert screener.signal_status(bars.iloc[:1], "above_ma20") is None
 
 
+def test_tencent_quote_uses_field_52_for_pe_not_field_39():
+    parts = [""] * 53
+    parts[1] = "合成"
+    parts[2] = "600519"
+    parts[3] = "10.5"
+    parts[4] = "10"
+    parts[6] = "100"
+    parts[30] = "20261109144725"
+    parts[32] = "-1.2"
+    parts[35] = "10.5/100/1000000"
+    parts[39] = "99"
+    parts[44] = "18000"
+    parts[46] = "6.5"
+    parts[52] = "21.5"
+    text = 'v_sh600519="' + "~".join(parts) + '";'
+    rows = screener.astock_runtime.parse_tencent_quotes(text)
+    assert rows[0]["pe"] == 21.5
+    assert rows[0]["pb"] == 6.5
+    assert rows[0]["total_mv"] == 18000
+    assert rows[0]["volume"] == 10000
+    assert rows[0]["as_of"].startswith("2026-11-09 14:47:25")
+    assert "99" not in str(rows[0]["pe"])
+
+
+def test_eastmoney_failure_falls_through_to_tencent_pe(monkeypatch):
+    quotes, _, _ = screener.load_fixture(FIXTURE)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("HTTP 502")
+
+    parts = [""] * 53
+    parts[1] = "腾讯合成"
+    parts[2] = "600519"
+    parts[3] = "11"
+    parts[32] = "1"
+    parts[39] = "99"
+    parts[44] = "100"
+    parts[46] = "2"
+    parts[52] = "18"
+    payload_text = 'v_sh600519="' + "~".join(parts) + '";'
+
+    class Response:
+        text = payload_text
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(screener._data_source(), "get_quotes_for_codes", boom)
+    monkeypatch.setattr(screener.astock_runtime, "http_get", lambda *args, **kwargs: Response())
+    result = screener.screen(
+        where="pe>10 and pe<40",
+        scope=["600519", "000001"],
+        quotes=None,
+        provenance="live",
+    )
+    payload = screener.result_payload(result)
+    assert payload["provenance"] == "live"
+    assert payload["source"] == "tencent_qt"
+    assert [row["code"] for row in payload["rows"]] == ["600519"]
+    assert payload["rows"][0]["pe"] == 18
+    assert "000001" in payload["missing"] or "000001" in payload["filtered_out"] or "000001" in payload["not_evaluated"]
+
+
 def test_fixture_cli_json_is_synthetic():
     completed = subprocess.run(
         [

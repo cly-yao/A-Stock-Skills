@@ -286,32 +286,41 @@ def get_quotes_for_codes(codes: List[str], timeout: float = 8.0) -> pd.DataFrame
     if len(wanted) > 50:
         raise ValueError("单次最多请求 50 只，请分批。未自动翻页。")
     secids = ",".join(astock_runtime.em_secid(c) for c in wanted)
-    try:
-        resp = astock_runtime.http_get(
-            astock_runtime.EM_ULIST_URL,
-            params={
-                "fltt": "2",
-                "invt": "2",
-                "fields": "f12,f14,f2,f3,f6,f8,f9,f20,f21,f23",
-                "secids": secids,
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            },
-            timeout=float(timeout),
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as exc:
-        raise RuntimeError(f"东财个股批量行情失败: {exc}") from exc
-    diff = ((payload or {}).get("data") or {}).get("diff") or []
-    if not isinstance(diff, list):
-        raise RuntimeError("东财 ulist diff 不是列表")
+    params = {
+        "fltt": "2",
+        "invt": "2",
+        "fields": "f12,f14,f2,f3,f6,f8,f9,f20,f21,f23",
+        "secids": secids,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+    }
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+    errors = []
+    diff = None
+    used_url = None
+    for url in (astock_runtime.EM_ULIST_URL, astock_runtime.EM_ULIST_URL_ALT):
+        try:
+            resp = astock_runtime.http_get(url, params=params, timeout=float(timeout), headers=headers)
+            resp.raise_for_status()
+            payload = resp.json()
+            candidate = ((payload or {}).get("data") or {}).get("diff")
+            if not isinstance(candidate, list) or not candidate:
+                errors.append(f"{url} 没有 diff")
+                continue
+            diff = candidate
+            used_url = url
+            break
+        except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}: {exc}")
+    if diff is None:
+        raise RuntimeError("东财个股批量行情失败: " + " | ".join(errors))
     rows = astock_runtime.normalize_ulist_rows(diff)
     df = pd.DataFrame(rows)
     got = set(df["code"].tolist()) if not df.empty else set()
     missing = [c for c in wanted if c not in got]
     df.attrs["provenance"] = astock_runtime.PROVENANCE_LIVE
     df.attrs["source"] = "eastmoney_ulist"
+    df.attrs["source_url"] = used_url
+    df.attrs["fallback_errors"] = errors
     df.attrs["requested"] = wanted
     df.attrs["missing"] = missing
     df.attrs["universe_complete"] = not missing

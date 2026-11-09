@@ -52,6 +52,11 @@ def fmt_pct(value):
         return "-"
 
 
+def _shanghai_today() -> str:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+
+
 def fmt_num(value, digits=2):
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "-"
@@ -108,22 +113,58 @@ def _guard(section_id, title, fn):
 def _section_indices(transport):
     def run():
         symbols = ",".join(astock_runtime.MAJOR_INDEX_SINA)
-        response = _call(
-            transport,
-            astock_runtime.SINA_HQ_URL + symbols,
-            encoding="gb18030",
-            headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
-        )
-        rows = astock_runtime.parse_sina_index_quotes(response.text)
-        got = {row["symbol"] for row in rows}
-        missing = [symbol for symbol in astock_runtime.MAJOR_INDEX_SINA if symbol not in got]
+        rows = []
+        errors = []
+        try:
+            response = _call(
+                transport,
+                astock_runtime.SINA_HQ_URL + symbols,
+                encoding="gb18030",
+                headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
+            )
+            rows = astock_runtime.parse_sina_index_quotes(response.text)
+        except Exception as exc:
+            errors.append(f"sina_index_s: {type(exc).__name__}: {exc}")
+            rows = []
+        source = "sina_index_s"
+        note = "新浪简版指数行情。该接口没有逐指数时间戳，不补写 as_of。"
+        if not rows:
+            errors.append("sina_index_s: 没有解析出指数")
+            qt_symbols = ",".join(symbol.split("_", 1)[-1] for symbol in astock_runtime.MAJOR_INDEX_SINA)
+            response = _call(
+                transport,
+                astock_runtime.TENCENT_QT_URL + qt_symbols,
+                encoding="gbk",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            parsed = astock_runtime.parse_tencent_quotes(response.text, include_fundamentals=False)
+            rows = []
+            for row in parsed:
+                rows.append({
+                    "symbol": row["code"],
+                    "code": row["code"],
+                    "name": row.get("name"),
+                    "price": row.get("price"),
+                    "change": row.get("change"),
+                    "pct_change": row.get("pct_change"),
+                    "as_of": row.get("as_of"),
+                    "source": "tencent_qt",
+                })
+            source = "tencent_qt"
+            note = "新浪指数失败后改用腾讯 qt。as_of 是源里的交易所时间，标为 Asia/Shanghai。指数行不使用 PE/市值字段。"
+        def _index_code(symbol: str) -> str:
+            body = symbol.split("_", 1)[-1]
+            return body[2:] if body[:2] in {"sh", "sz", "bj"} else body
+
+        got = {_index_code(str(row.get("code") or row.get("symbol") or "")) for row in rows}
+        missing = [symbol for symbol in astock_runtime.MAJOR_INDEX_SINA if _index_code(symbol) not in got]
         status = "ok" if rows and not missing else ("partial" if rows else "failed")
-        error = None if rows else "指数接口没有返回可解析行情"
+        error = None if rows else " | ".join(errors) or "指数接口没有返回可解析行情"
         return _section(
-            "indices", "主要指数", status, source="sina_index_s", rows=rows,
-            note="新浪简版指数行情，一次请求。",
+            "indices", "主要指数", status, source=source, rows=rows,
+            note=note,
             error=error,
-            extra={"missing_symbols": missing},
+            extra={"missing_symbols": missing, "attempt_errors": errors},
         )
     return _guard("indices", "主要指数", run)
 
@@ -171,26 +212,44 @@ def _section_breadth(transport):
 
 def _section_industry(transport):
     def run():
-        response = _call(
-            transport,
-            astock_runtime.EM_CLIST_URL,
-            params={
-                "pn": "1",
-                "pz": "5",
-                "po": "1",
-                "np": "1",
-                "fltt": "2",
-                "invt": "2",
-                "fid": "f3",
-                "fs": "m:90+t:2+f:!50",
-                "fields": "f12,f14,f3,f128,f140",
-            },
-        )
-        payload = response.json()
+        params = {
+            "pn": "1",
+            "pz": "5",
+            "po": "1",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f3",
+            "fs": "m:90+t:2+f:!50",
+            "fields": "f12,f14,f3,f128,f140",
+        }
+        payload = None
+        source = "eastmoney_industry_clist"
+        errors = []
+        for url in (astock_runtime.EM_CLIST_URL, astock_runtime.EM_CLIST_URL_ALT):
+            try:
+                response = _call(transport, url, params=params)
+                candidate = response.json()
+                diff_try = ((candidate or {}).get("data") or {}).get("diff")
+                if isinstance(diff_try, list) and diff_try:
+                    payload = candidate
+                    source = "eastmoney_industry_clist" if "82.push2" not in url else "eastmoney_industry_clist_82"
+                    break
+                errors.append(f"{url} 没有板块行")
+            except astock_runtime.BudgetExceeded:
+                raise
+            except Exception as exc:
+                errors.append(f"{url}: {type(exc).__name__}: {exc}")
+        if payload is None:
+            return _section(
+                "industry", "行业板块", "failed", source="eastmoney_industry_clist",
+                error=" | ".join(errors) or "板块列表为空",
+                note="两个东财主机各请求一次。未改用其他板块口径填充。",
+            )
         data = (payload or {}).get("data") or {}
         diff = data.get("diff") or []
         if not isinstance(diff, list) or not diff:
-            return _section("industry", "行业板块", "failed", source="eastmoney_industry_clist",
+            return _section("industry", "行业板块", "failed", source=source,
                             error="板块列表为空", note="未改用其他板块口径填充。")
         rows = []
         for item in diff:
@@ -202,7 +261,7 @@ def _section_industry(transport):
                 "leader_code": item.get("f140"),
             })
         return _section(
-            "industry", "行业板块 Top 5", "ok", source="eastmoney_industry_clist",
+            "industry", "行业板块 Top 5", "ok", source=source,
             rows=rows,
             note=f"服务端按涨跌幅降序返回的前 {len(rows)} 名。板块总数 {data.get('total')}。未翻页。",
             extra={"board_total": data.get("total"), "page_size": 5},
@@ -212,15 +271,15 @@ def _section_industry(transport):
 
 def _section_limit_up(transport, date: Optional[str]):
     def run():
+        trade_date = (date or _shanghai_today()).replace("-", "")
         params = {
             "ut": "7eea3edcaed734bea9cbfc24409ed989",
             "dpt": "wz.ztzt",
             "Pageindex": "0",
             "pagesize": "5",
             "sort": "fbt:asc",
+            "date": trade_date,
         }
-        if date:
-            params["date"] = date.replace("-", "")
         response = _call(transport, astock_runtime.EM_ZT_URL, params=params)
         payload = response.json()
         if not isinstance(payload, dict):
@@ -253,52 +312,104 @@ def _section_limit_up(transport, date: Optional[str]):
                 "industry": item.get("hybk"),
                 "p_raw": item.get("p"),
             })
-        status = "partial" if total is not None and len(rows) < int(total) else "ok"
+        # pagesize=5 is the contract. A smaller page than tc is still complete for that contract.
+        status = "ok" if total is not None else "partial"
         return _section(
             "limit_up", "涨停", status, source="eastmoney_zt_pool", rows=rows,
             note=(
-                "tc 是接口给出的涨停总数。表内只是 pagesize=5 的样本，不是完整名单。"
+                f"请求日期 {trade_date}（Asia/Shanghai，缺省为当天，不改用其他交易日）。"
+                "tc 是接口给出的涨停总数。表内最多 5 行样本，不是完整名单。"
                 "p_raw 是源字段原值，未换算成价格。"
             ),
-            extra={"total": total, "qdate": data.get("qdate"), "sample_size": len(rows)},
+            extra={"total": total, "qdate": data.get("qdate"), "sample_size": len(rows),
+                   "requested_date": trade_date},
         )
     return _guard("limit_up", "涨停", run)
 
 
 def _quote_codes(transport, codes: list[str]):
     secids = ",".join(astock_runtime.em_secid(code) for code in codes)
-    response = _call(
-        transport,
-        astock_runtime.EM_ULIST_URL,
-        params={
-            "fltt": "2",
-            "invt": "2",
-            "fields": "f12,f14,f2,f3,f6,f8,f9,f20,f21,f23",
-            "secids": secids,
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        },
-    )
-    payload = response.json()
-    diff = ((payload or {}).get("data") or {}).get("diff") or []
-    if not isinstance(diff, list):
-        raise RuntimeError("ulist diff 不是列表")
-    return astock_runtime.normalize_ulist_rows(diff)
+    params = {
+        "fltt": "2",
+        "invt": "2",
+        "fields": "f12,f14,f2,f3,f6,f8,f9,f20,f21,f23",
+        "secids": secids,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+    }
+    errors = []
+    for url in (astock_runtime.EM_ULIST_URL, astock_runtime.EM_ULIST_URL_ALT):
+        try:
+            response = _call(transport, url, params=params)
+            diff = ((response.json() or {}).get("data") or {}).get("diff")
+            if isinstance(diff, list) and diff:
+                return astock_runtime.normalize_ulist_rows(diff)
+            errors.append(f"{url} 没有 diff")
+        except astock_runtime.BudgetExceeded:
+            raise
+        except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}: {exc}")
+    raise RuntimeError(" | ".join(errors) or "ulist 没有返回行情")
 
 
 def _section_quote(transport, code: str):
     def run():
-        rows = _quote_codes(transport, [code])
-        matched = [row for row in rows if row["code"] == code]
-        if not matched:
-            return _section("quote", "公司概况", "failed", source="eastmoney_ulist",
-                            error=f"{code} 不在返回结果中", note="未用全市场表查找，也未填 0 价格。")
-        return _section("quote", "公司概况", "ok", source="eastmoney_ulist", rows=matched,
-                        note="单只批量接口，total_mv 单位为亿元。")
+        errors = []
+        try:
+            rows = _quote_codes(transport, [code])
+            matched = [row for row in rows if row["code"] == code and row.get("price") is not None]
+            if matched:
+                return _section(
+                    "quote", "公司概况", "ok", source=matched[0].get("source") or "eastmoney_ulist",
+                    rows=matched,
+                    note="东财 ulist。total_mv 单位为亿元。该响应没有单独的 as_of 字段，不补写时间。",
+                    extra={"attempt_errors": errors},
+                )
+            errors.append("eastmoney_ulist: 没有这只股票的价格")
+        except astock_runtime.BudgetExceeded:
+            raise
+        except Exception as exc:
+            errors.append(f"eastmoney_ulist: {type(exc).__name__}: {exc}")
+        try:
+            response = _call(
+                transport,
+                astock_runtime.TENCENT_QT_URL + astock_runtime.sina_symbol(code),
+                encoding="gbk",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            matched = [
+                row for row in astock_runtime.parse_tencent_quotes(response.text)
+                if row["code"] == code and row.get("price") is not None
+            ]
+            if not matched:
+                errors.append("tencent_qt: 没有解析出价格")
+            else:
+                missing = [name for name in ("pe", "pb", "total_mv") if matched[0].get(name) is None]
+                status = "partial" if missing else "ok"
+                return _section(
+                    "quote", "公司概况", status, source="tencent_qt", rows=matched,
+                    note=(
+                        "东财 ulist 失败后改用腾讯 qt。pe 为字段 52，不是字段 39。"
+                        "total_mv 为字段 44，单位亿元。as_of 来自字段 30，标为 Asia/Shanghai。"
+                        + (f" 缺少字段: {', '.join(missing)}。" if missing else "")
+                    ),
+                    error=None if not missing else "缺少 " + ",".join(missing),
+                    extra={"attempt_errors": errors},
+                )
+        except astock_runtime.BudgetExceeded:
+            raise
+        except Exception as exc:
+            errors.append(f"tencent_qt: {type(exc).__name__}: {exc}")
+        return _section(
+            "quote", "公司概况", "failed", source=None,
+            error=" | ".join(errors),
+            note="东财两个主机和腾讯各失败或为空。未填 0 价格。",
+        )
     return _guard("quote", "公司概况", run)
 
 
-def _section_technical(transport, code: str, days: int = 60):
-    def run():
+def _bars_from_ifzq_or_sina(transport, code: str, days: int):
+    errors = []
+    try:
         response = _call(
             transport,
             astock_runtime.IFZQ_URL,
@@ -306,9 +417,32 @@ def _section_technical(transport, code: str, days: int = 60):
             headers={"User-Agent": "Mozilla/5.0"},
         )
         rows = astock_runtime.parse_ifzq_kline(response.json(), code)
+        if len(rows) >= 5:
+            return rows, errors
+        errors.append(f"ifzq_gtimg: 只有 {len(rows)} 根")
+    except astock_runtime.BudgetExceeded:
+        raise
+    except Exception as exc:
+        errors.append(f"ifzq_gtimg: {type(exc).__name__}: {exc}")
+    response = _call(
+        transport,
+        astock_runtime.SINA_KLINE_URL,
+        params={"symbol": astock_runtime.sina_symbol(code), "scale": "240", "ma": "no", "datalen": str(int(days))},
+        headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
+    )
+    rows = astock_runtime.parse_sina_kline(response.json(), code)
+    return rows, errors
+
+
+def _section_technical(transport, code: str, days: int = 60):
+    def run():
+        rows, errors = _bars_from_ifzq_or_sina(transport, code, days)
         if len(rows) < 5:
-            return _section("technical", "技术面", "failed", source="ifzq_gtimg",
-                            error=f"K 线只有 {len(rows)} 根", note="样本不足，未计算均线。")
+            return _section(
+                "technical", "技术面", "failed", source=None,
+                error=" | ".join(errors) or f"K 线只有 {len(rows)} 根",
+                note="ifzq 前复权失败或不足后，新浪 K 线也不足。未计算均线，未编造收盘价。",
+            )
         closes = [row["close"] for row in rows if row.get("close") is not None]
         last = closes[-1]
         ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else None
@@ -321,8 +455,19 @@ def _section_technical(transport, code: str, days: int = 60):
                 trend = "空头排列"
             else:
                 trend = "震荡"
+        adjust = rows[-1].get("adjust")
+        status = "ok" if ma20 is not None and adjust == "qfq" else "partial"
+        note = "均线只在样本够长时计算。"
+        if adjust == "qfq":
+            note = "ifzq qfqday，复权标记 qfq。最后一根日期是源里的交易日。"
+        elif adjust == "raw":
+            note = "ifzq 只返回了未复权 day，未把它标成 qfq。"
+        else:
+            note = "新浪 getKLineData 未声明复权方式，adjust=unknown，不把它标成 qfq。"
+        if errors:
+            note += " 前序来源: " + " | ".join(errors)
         return _section(
-            "technical", "技术面", "ok" if ma20 is not None else "partial",
+            "technical", "技术面", status,
             source=rows[-1].get("source"),
             rows=[{
                 "close": last,
@@ -330,45 +475,92 @@ def _section_technical(transport, code: str, days: int = 60):
                 "ma20": ma20,
                 "trend": trend,
                 "bars": len(rows),
-                "adjust": rows[-1].get("adjust"),
+                "adjust": adjust,
                 "last_date": rows[-1].get("date"),
             }],
-            note="ifzq 前复权日 K，一次请求。均线只在样本够长时计算。",
+            note=note,
+            error=None if status == "ok" else f"adjust={adjust}",
         )
     return _guard("technical", "技术面", run)
 
 
 def _section_flow(transport, code: str):
     def run():
-        response = _call(
-            transport,
-            astock_runtime.EM_FFLOW_URL,
-            params={
-                "lmt": "5",
-                "klt": "101",
-                "secid": astock_runtime.em_secid(code),
-                "fields1": "f1,f2,f3,f7",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63",
-            },
-        )
-        data = (response.json() or {}).get("data") or {}
-        klines = data.get("klines") or []
-        if not klines:
-            return _section("fund_flow", "资金面", "failed", source="eastmoney_fflow",
-                            error="没有资金流 K 线")
-        rows = []
-        for line in klines:
-            parts = str(line).split(",")
-            if len(parts) < 2:
-                continue
-            rows.append({
-                "date": parts[0],
-                "main_net": astock_runtime.to_float(parts[1]),
-                "raw_fields": len(parts),
-            })
+        errors = []
+        try:
+            response = _call(
+                transport,
+                astock_runtime.EM_FFLOW_URL,
+                params={
+                    "lmt": "5",
+                    "klt": "101",
+                    "secid": astock_runtime.em_secid(code),
+                    "fields1": "f1,f2,f3,f7",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63",
+                },
+            )
+            data = (response.json() or {}).get("data") or {}
+            klines = data.get("klines") if isinstance(data, dict) else None
+            if klines:
+                rows = []
+                for line in klines:
+                    parts = str(line).split(",")
+                    if len(parts) < 2:
+                        continue
+                    rows.append({
+                        "date": parts[0],
+                        "main_net": astock_runtime.to_float(parts[1]),
+                        "raw_fields": len(parts),
+                    })
+                if rows:
+                    return _section(
+                        "fund_flow", "资金面", "ok", source="eastmoney_fflow", rows=rows[-5:],
+                        note="主力净流入是 eastmoney fields2 的 f52（第二列），单位元。只取最近 5 根。不是腾讯口径。",
+                    )
+            errors.append("eastmoney_fflow: 没有 klines")
+        except astock_runtime.BudgetExceeded:
+            raise
+        except Exception as exc:
+            errors.append(f"eastmoney_fflow: {type(exc).__name__}: {exc}")
+        try:
+            response = _call(
+                transport,
+                astock_runtime.TENCENT_FLOW_URL,
+                params={"code": astock_runtime.sina_symbol(code)},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            payload = response.json()
+            data = (payload or {}).get("data") or {}
+            today = data.get("todayFundFlow") or {}
+            five = (data.get("fiveDayFundFlow") or {}).get("DayMainNetInList") or []
+            rows = []
+            for item in five:
+                if not isinstance(item, dict):
+                    continue
+                rows.append({
+                    "date": item.get("date"),
+                    "main_net": astock_runtime.to_float(item.get("mainNetIn")),
+                })
+            if not rows:
+                errors.append("tencent_hsfundtab: 没有五日主力净流入")
+            else:
+                desc = today.get("desc") or "腾讯未返回口径说明"
+                return _section(
+                    "fund_flow", "资金面", "ok", source="tencent_hsfundtab", rows=rows[-5:],
+                    note=(
+                        "东财 fflow 失败后使用腾讯 hsfundtab 的 DayMainNetInList。"
+                        "这不是 eastmoney f52，不能和东财序列混用。腾讯说明: " + str(desc)
+                    ),
+                    extra={"attempt_errors": errors},
+                )
+        except astock_runtime.BudgetExceeded:
+            raise
+        except Exception as exc:
+            errors.append(f"tencent_hsfundtab: {type(exc).__name__}: {exc}")
         return _section(
-            "fund_flow", "资金面", "ok", source="eastmoney_fflow", rows=rows[-5:],
-            note="主力净流入取 fields2 的 f52（第二列），单位为元。只请求最近 5 根。",
+            "fund_flow", "资金面", "failed", source=None,
+            error=" | ".join(errors),
+            note="没有可用的主力净流入序列，未填 0。",
         )
     return _guard("fund_flow", "资金面", run)
 
@@ -437,7 +629,7 @@ def _base_report(kind, provenance, transport, date_note=None):
 
 
 def build_daily_report(date: Optional[str] = None, transport=None, provenance=None,
-                       max_calls: int = 6, timeout: float = 8.0) -> dict:
+                       max_calls: int = 8, timeout: float = 8.0) -> dict:
     provenance, transport = _resolve_transport(transport, provenance, max_calls, timeout)
     today = datetime.now().strftime("%Y-%m-%d")
     report_date = date or today
@@ -460,7 +652,7 @@ def build_daily_report(date: Optional[str] = None, transport=None, provenance=No
 
 
 def build_stock_report(code: str, transport=None, provenance=None,
-                       max_calls: int = 5, timeout: float = 8.0) -> dict:
+                       max_calls: int = 8, timeout: float = 8.0) -> dict:
     code = astock_runtime.normalize_code(code)
     provenance, transport = _resolve_transport(transport, provenance, max_calls, timeout)
     report = _base_report("stock", provenance, transport)
@@ -635,6 +827,8 @@ def _render_section(section: dict) -> str:
             f"- PE: {fmt_num(row.get('pe'))}",
             f"- PB: {fmt_num(row.get('pb'))}",
         ])
+        if row.get("as_of"):
+            lines.append(f"- as_of: {row.get('as_of')}")
     elif section["id"] == "technical" and rows:
         row = rows[0]
         lines.extend([
@@ -743,8 +937,13 @@ def report_portfolio(config_path: Optional[str] = None, save: bool = False, **kw
 
 
 def _exit_code(report: dict) -> int:
+    """0 only when every section is ok. 3 is partial. 1 is a failed or skipped section."""
     statuses = [section["status"] for section in report.get("sections") or []]
-    if any(status in {"ok", "partial"} for status in statuses):
+    if not statuses or any(status in {"failed", "skipped"} for status in statuses):
+        return 1
+    if any(status == "partial" for status in statuses):
+        return 3
+    if all(status == "ok" for status in statuses):
         return 0
     return 1
 
@@ -757,14 +956,14 @@ def main(argv=None) -> int:
     daily.add_argument("--date")
     daily.add_argument("--save", action="store_true")
     daily.add_argument("--json", action="store_true")
-    daily.add_argument("--max-calls", type=int, default=6)
+    daily.add_argument("--max-calls", type=int, default=8)
     daily.add_argument("--timeout", type=float, default=8.0)
 
     stock = sub.add_parser("stock", help="个股研报")
     stock.add_argument("code")
     stock.add_argument("--save", action="store_true")
     stock.add_argument("--json", action="store_true")
-    stock.add_argument("--max-calls", type=int, default=5)
+    stock.add_argument("--max-calls", type=int, default=8)
     stock.add_argument("--timeout", type=float, default=8.0)
 
     portfolio = sub.add_parser("portfolio", help="持仓报告")

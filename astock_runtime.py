@@ -36,12 +36,20 @@ SINA_MC_URL = (
 )
 SINA_HQ_URL = "https://hq.sinajs.cn/list="
 EM_ULIST_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+EM_ULIST_URL_ALT = "https://82.push2.eastmoney.com/api/qt/ulist.np/get"
 EM_CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+EM_CLIST_URL_ALT = "https://82.push2.eastmoney.com/api/qt/clist/get"
 EM_FENBU_URL = "https://push2ex.eastmoney.com/getTopicZDFenBu"
 EM_ZT_URL = "https://push2ex.eastmoney.com/getTopicZTPool"
 EM_FFLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 EM_NEWS_URL = "https://search-api-web.eastmoney.com/search/jsonp"
-IFZQ_URL = "http://ifzq.gtimg.cn/appstock/app/fqkline/get"
+IFZQ_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+SINA_KLINE_URL = (
+    "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    "CN_MarketData.getKLineData"
+)
+TENCENT_QT_URL = "https://qt.gtimg.cn/q="
+TENCENT_FLOW_URL = "https://proxy.finance.qq.com/cgi/cgi-bin/fundflow/hsfundtab"
 
 # Sina mktcap / nmc are 万元. Screener strategies treat total_mv as 亿元.
 SINA_MV_WAN_TO_YI = 10000.0
@@ -364,6 +372,103 @@ def parse_sina_index_quotes(text: str) -> list[dict]:
                 "source": "sina_index_s",
             }
         )
+    return rows
+
+
+def parse_tencent_quotes(text: str, include_fundamentals: bool = True) -> list[dict]:
+    """Parse qt.gtimg.cn quotes.
+
+    Field numbers were checked on 2026-11-09 for sh600519 against an Eastmoney
+    ulist print of the same name: field 3 was the price, field 46 matched PB,
+    field 44 was total market cap in 亿元, and field 52 matched 动态市盈率
+    (20.97 at price 1442.17). Field 39 is a different PE and is not copied into
+    ``pe``. Volume field 6 is 手, stored here as shares (×100). ``as_of`` is the
+    exchange timestamp in the payload, labeled Asia/Shanghai, not converted.
+    """
+    rows = []
+    pattern = re.compile(r'v_([a-z]{2}\d+)="([^"]*)"')
+    for match in pattern.finditer(text):
+        symbol, body = match.group(1), match.group(2)
+        if not body or "~" not in body:
+            continue
+        parts = body.split("~")
+        if len(parts) < 35:
+            continue
+        price = to_float(parts[3])
+        if price is None:
+            continue
+        code_text = parts[2] if len(parts) > 2 and parts[2] else symbol[2:]
+        try:
+            code = normalize_code(code_text)
+        except ValueError:
+            continue
+        amount = None
+        if len(parts) > 35 and "/" in parts[35]:
+            bits = parts[35].split("/")
+            if len(bits) >= 3:
+                amount = to_float(bits[2])
+        volume_hand = to_float(parts[6]) if len(parts) > 6 else None
+        as_of_raw = parts[30] if len(parts) > 30 else ""
+        as_of = None
+        if len(as_of_raw) == 14 and as_of_raw.isdigit():
+            as_of = (
+                f"{as_of_raw[0:4]}-{as_of_raw[4:6]}-{as_of_raw[6:8]} "
+                f"{as_of_raw[8:10]}:{as_of_raw[10:12]}:{as_of_raw[12:14]} Asia/Shanghai"
+            )
+        row = {
+            "code": code,
+            "name": parts[1] if len(parts) > 1 else "",
+            "price": price,
+            "pre_close": to_float(parts[4]) if len(parts) > 4 else None,
+            "open": to_float(parts[5]) if len(parts) > 5 else None,
+            "high": to_float(parts[33]) if len(parts) > 33 else None,
+            "low": to_float(parts[34]) if len(parts) > 34 else None,
+            "change": to_float(parts[31]) if len(parts) > 31 else None,
+            "pct_change": to_float(parts[32]) if len(parts) > 32 else None,
+            "volume": None if volume_hand is None else volume_hand * 100,
+            "volume_unit": "股",
+            "volume_conversion": "tencent field 6 (手) * 100",
+            "amount": amount,
+            "turnover": to_float(parts[38]) if len(parts) > 38 else None,
+            "pe": None,
+            "pb": None,
+            "total_mv": None,
+            "circ_mv": None,
+            "total_mv_unit": "亿元",
+            "as_of": as_of,
+            "source": "tencent_qt",
+        }
+        if include_fundamentals and len(parts) > 52:
+            row["pe"] = to_float(parts[52])
+            row["pb"] = to_float(parts[46]) if len(parts) > 46 else None
+            row["total_mv"] = to_float(parts[44]) if len(parts) > 44 else None
+            row["circ_mv"] = to_float(parts[45]) if len(parts) > 45 else None
+            row["total_mv_conversion"] = "tencent field 44 (亿元); pe is field 52, not field 39"
+        rows.append(row)
+    return rows
+
+
+def parse_sina_kline(payload, code: str) -> list[dict]:
+    """Sina getKLineData bars. Adjustment is not declared by this endpoint."""
+    if not isinstance(payload, list):
+        return []
+    rows = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        close = to_float(item.get("close"))
+        if close is None:
+            continue
+        rows.append({
+            "date": item.get("day"),
+            "open": to_float(item.get("open")),
+            "close": close,
+            "high": to_float(item.get("high")),
+            "low": to_float(item.get("low")),
+            "volume": to_float(item.get("volume")),
+            "source": "sina_kline",
+            "adjust": "unknown",
+        })
     return rows
 
 

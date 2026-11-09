@@ -41,24 +41,20 @@ def main() -> int:
         "wall_sec": None,
     }
     payload = None
-    attempts = []
-    for attempt in (1, 2):
-        try:
-            screened = screener.screen(scope=CODES, where=WHERE, timeout=12, top_n=10)
-            payload = screener.result_payload(screened)
-            attempts.append({
-                "attempt": attempt,
-                "row_count": payload["row_count"],
-                "source": payload.get("source"),
-                "fallback": payload.get("fallback"),
-                "errors": payload.get("errors"),
-            })
-            if payload["row_count"] > 0 and not payload.get("fallback"):
-                break
-        except Exception as exc:
-            attempts.append({"attempt": attempt, "exception": f"{type(exc).__name__}: {exc}"})
-            payload = None
-    document["screener_attempts"] = attempts
+    try:
+        screened = screener.screen(scope=CODES, where=WHERE, timeout=8, top_n=10)
+        payload = screener.result_payload(screened)
+        document["screener_attempts"] = [{
+            "attempt": 1,
+            "row_count": payload["row_count"],
+            "source": payload.get("source"),
+            "fallback": payload.get("fallback"),
+            "errors": payload.get("errors"),
+            "not_evaluated": payload.get("not_evaluated"),
+        }]
+    except Exception as exc:
+        document["screener_attempts"] = [{"attempt": 1, "exception": f"{type(exc).__name__}: {exc}"}]
+        payload = None
     try:
         if payload is None:
             raise RuntimeError("screener did not return a payload")
@@ -162,18 +158,44 @@ def main() -> int:
         document["errors"].append(f"stock exception: {type(exc).__name__}: {exc}")
 
     document["wall_sec"] = round(time.time() - started, 3)
+    def _coverage(block):
+        if not block or "sections" not in block:
+            return "missing"
+        statuses = [section["status"] for section in block["sections"]]
+        if any(status in {"failed", "skipped"} for status in statuses):
+            return "failed"
+        if any(status == "partial" for status in statuses):
+            return "partial"
+        if statuses and all(status == "ok" for status in statuses):
+            return "ok"
+        return "failed"
+
+    document["coverage"] = {
+        "screener": "ok" if document.get("screener") and document["screener"].get("row_count") and not document["screener"].get("not_evaluated") else "failed",
+        "daily": _coverage(document.get("daily")),
+        "stock": _coverage(document.get("stock")),
+    }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(document, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     print(json.dumps({
         "wall_sec": document["wall_sec"],
         "errors": document["errors"],
+        "coverage": document["coverage"],
         "screener_rows": None if not document["screener"] else document["screener"]["row_count"],
-        "screener_provenance": None if not document["screener"] else document["screener"]["provenance"],
+        "screener_source": None if not document["screener"] else document["screener"].get("source"),
         "daily": document["daily"],
         "stock": document["stock"],
         "output": str(OUT),
     }, ensure_ascii=False, indent=2))
-    return 0 if not document["errors"] else 2
+    ranks = {"ok": 0, "partial": 3, "failed": 1, "missing": 1}
+    exits = [ranks[document["coverage"][name]] for name in ("screener", "daily", "stock")]
+    if document["errors"]:
+        exits.append(1)
+    if any(code == 1 for code in exits):
+        return 1
+    if any(code == 3 for code in exits):
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

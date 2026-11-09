@@ -162,10 +162,10 @@ def test_bad_certificate_fails_the_report_without_using_the_body(tmp_path):
 
     assert built["provenance"] == "synthetic"
     assert built["sections"]
-    assert all(section["status"] == "failed" for section in built["sections"])
+    assert all(section["status"] in {"failed", "skipped"} for section in built["sections"])
+    assert any("SSLError" in (section.get("error") or "") for section in built["sections"])
     for section in built["sections"]:
         assert section["rows"] == []
-        assert "SSLError" in (section.get("error") or "")
     text = report.render_markdown(built)
     assert "999999" not in text
     assert "not-a-quote" not in text
