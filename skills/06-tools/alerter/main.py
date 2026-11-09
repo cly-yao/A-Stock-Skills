@@ -67,7 +67,7 @@ def send_feishu(webhook: str, content: str) -> bool:
         data = {
             "msg_type": "interactive",
             "card": {
-                "header": {"title": {"tag": "plain_text", "content": "A股告警"}}},
+                "header": {"title": {"tag": "plain_text", "content": "A股告警"}},
                 "elements": [{"tag": "markdown", "content": content}],
             },
         }

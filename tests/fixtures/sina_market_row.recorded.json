@@ -1,0 +1,23 @@
+{
+  "provenance": "recorded_live",
+  "captured_at": "2026-11-09T11:34:59+08:00",
+  "note": "One Sina Market_Center row captured during diagnosis. Parser fixture only. Not a fresh quote and not a synthetic invention.",
+  "row": {
+    "symbol": "bj920000",
+    "code": "920000",
+    "name": "安徽凤凰",
+    "trade": "11.250",
+    "pricechange": 0.01,
+    "changepercent": 0.089,
+    "open": "11.270",
+    "high": "11.580",
+    "low": "11.250",
+    "volume": 196884,
+    "amount": 2239184,
+    "per": 15.625,
+    "pb": 1.49,
+    "mktcap": 103140,
+    "nmc": 64793.165625,
+    "turnoverratio": 0.34185
+  }
+}

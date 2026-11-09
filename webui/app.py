@@ -6,11 +6,31 @@ A-Stock-Skills Web UI
 启动: streamlit run webui/app.py
 """
 
+import importlib.util
 import os
 import sys
 
 # 添加项目根目录到路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+
+def _load_attr(rel, attr):
+    """Load a function by file path. Hyphenated skill directories are not import packages."""
+    path = os.path.join(REPO, rel)
+    if not os.path.isfile(path):
+        return None
+    module_name = "webui_dyn_" + str(abs(hash(rel + ":" + attr)))
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, attr, None)
+
+
+def _missing(label):
+    st.error(f"{label} 不在当前发行包内。未请求行情，未编造数据。")
 
 import streamlit as st
 import pandas as pd
@@ -117,7 +137,7 @@ if category == "🏠 首页" or skill == "首页":
             st.session_state["skill"] = "涨停板"
     with quick_cols[2]:
         if st.button("💰 资金流向", use_container_width=True):
-            st.session_state["skill"] = "资金流向")
+            st.session_state["skill"] = "资金流向"
 
 
 # ============================================================
@@ -129,7 +149,13 @@ def render_realtime():
     code = st.text_input("股票代码", value="000001")
     if st.button("查询"):
         with st.spinner("加载中..."):
-            from skills.02-data-collection.stock-basic-info.stock_basic_info import get_realtime
+            get_realtime = _load_attr(
+                "skills/02-data-collection/stock-basic-info/stock_basic_info.py",
+                "get_realtime",
+            )
+            if get_realtime is None:
+                _missing("stock-basic-info")
+                return
             rt = get_realtime(code)
             if rt:
                 col1, col2, col3 = st.columns(3)
@@ -151,7 +177,13 @@ def render_zt_pool():
     st.header("🚀 涨停板追踪")
     if st.button("刷新涨停板"):
         with st.spinner("加载中..."):
-            from skills.04-stock-analysis.limit-up-tracker.limit_up_tracker import get_zt_pool
+            get_zt_pool = _load_attr(
+                "skills/04-stock-analysis/limit-up-tracker/limit_up_tracker.py",
+                "get_zt_pool",
+            )
+            if get_zt_pool is None:
+                _missing("limit-up-tracker")
+                return
             df = get_zt_pool()
             if not df.empty:
                 st.metric("涨停数", len(df))
@@ -167,12 +199,23 @@ def render_technical():
     code = st.text_input("股票代码", value="000001", key="tech_code")
     if st.button("分析"):
         with st.spinner("分析中..."):
-            from skills.04-stock-analysis.stock-technical-analysis.stock_technical_analysis import full_technical_analysis
+            full_technical_analysis = _load_attr(
+                "skills/04-stock-analysis/stock-technical-analysis/main.py",
+                "full_technical_analysis",
+            )
+            if full_technical_analysis is None:
+                _missing("stock-technical-analysis")
+                return
             result = full_technical_analysis(code)
             if result:
                 # K线图
-                from skills.02-data-collection.stock-basic-info.stock_basic_info import get_realtime
-                from skills.04-stock-analysis.stock-technical-analysis.stock_technical_analysis import get_kline
+                get_kline = _load_attr(
+                    "skills/04-stock-analysis/stock-technical-analysis/main.py",
+                    "get_kline",
+                )
+                if get_kline is None:
+                    _missing("stock-technical-analysis get_kline")
+                    return
                 df = get_kline(code, days=60)
                 if not df.empty:
                     fig = go.Figure()
@@ -207,8 +250,11 @@ def render_daily_report():
     st.header("📝 每日复盘报告")
     if st.button("生成今日报告"):
         with st.spinner("生成中... (可能需要 10-30 秒)"):
-            from skills.05-reports.daily-market-report.daily_market_report import generate_daily_report
-            report = generate_daily_report()
+            report_daily = _load_attr("skills/05-reports/report/main.py", "report_daily")
+            if report_daily is None:
+                _missing("report")
+                return
+            report = report_daily()
             st.markdown(report)
 
 
@@ -218,8 +264,11 @@ def render_research_report():
     code = st.text_input("股票代码", value="000001", key="research_code")
     if st.button("生成研报"):
         with st.spinner("生成中..."):
-            from skills.05-reports.stock-research-report.stock_research_report import generate_research
-            report = generate_research(code)
+            report_stock = _load_attr("skills/05-reports/report/main.py", "report_stock")
+            if report_stock is None:
+                _missing("report")
+                return
+            report = report_stock(code)
             st.markdown(report)
 
 
@@ -230,7 +279,13 @@ def render_watchlist():
     if st.button("查询"):
         codes = [c.strip() for c in codes_input.split(",")]
         with st.spinner("查询中..."):
-            from skills.02-data-collection.watchlist-monitor.watchlist_monitor import get_realtime_quotes
+            get_realtime_quotes = _load_attr(
+                "skills/02-data-collection/watchlist-monitor/main.py",
+                "get_realtime_quotes",
+            )
+            if get_realtime_quotes is None:
+                _missing("watchlist-monitor")
+                return
             quotes = get_realtime_quotes(codes)
             if quotes:
                 # 转为 DataFrame
@@ -252,14 +307,26 @@ def render_market():
     st.header("📊 大盘分析")
     if st.button("分析大盘"):
         with st.spinner("分析中..."):
-            from skills.03-market-analysis.market-analysis.market_analysis import full_market_analysis
+            full_market_analysis = _load_attr(
+                "skills/03-market-analysis/market-analysis/market_analysis.py",
+                "full_market_analysis",
+            )
+            if full_market_analysis is None:
+                _missing("market-analysis")
+                return
             result = full_market_analysis("000001", days=60)
             if result:
                 st.subheader(f"上证指数分析")
                 st.write(f"**建议**: {result.get('advice', '-')}")
 
                 # 主要指数
-                from skills.02-data-collection.market-data-collector.market_data_collector import get_major_indices
+                get_major_indices = _load_attr(
+                    "skills/02-data-collection/market-data-collector/market_data_collector.py",
+                    "get_major_indices",
+                )
+                if get_major_indices is None:
+                    _missing("market-data-collector")
+                    return
                 df = get_major_indices()
                 if not df.empty:
                     st.subheader("主要指数")
@@ -267,7 +334,13 @@ def render_market():
                     st.dataframe(df[cols], use_container_width=True)
 
                 # 市场广度
-                from skills.02-data-collection.market-data-collector.market_data_collector import get_market_breadth
+                get_market_breadth = _load_attr(
+                    "skills/02-data-collection/market-data-collector/market_data_collector.py",
+                    "get_market_breadth",
+                )
+                if get_market_breadth is None:
+                    _missing("market-data-collector")
+                    return
                 breadth = get_market_breadth()
                 if breadth:
                     col1, col2, col3, col4 = st.columns(4)

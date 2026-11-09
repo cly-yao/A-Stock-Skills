@@ -1,45 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""daily_update.py: 每天 15:30 跑一次, 更新全市场 K 线缓存
+r"""daily_update.py: 更新少量 K 线缓存。
 
 用法:
-    python daily_update.py                  # 跑全市场
-    python daily_update.py --codes 000001,600519   # 只更新指定
-    python daily_update.py --days 60        # 60 日 K 线
+    python daily_update.py --codes 000001,600519
+    python daily_update.py --max-codes 5 --days 60
+
+不带 --codes 且不带 --max-codes 时直接退出，避免全市场逐只下载。
 
 建议 cron (Linux/Mac):
-    30 15 * * 1-5 cd /path/to/A-Stock-Skills && python daily_update.py >> logs/daily.log 2>&1
+    30 15 * * 1-5 cd /path/to/A-Stock-Skills && python daily_update.py --max-codes 20
 
 建议 Windows 任务计划程序:
     触发器: 周一-周五 15:30
-    操作: python D:\myCode\python\a_stock_skills\daily_update.py
+    操作: python D:\myCode\python\a_stock_skills\daily_update.py --max-codes 20
 """
 
 import sys
 import time
 import argparse
-import pandas as pd
 from pathlib import Path
 from datetime import datetime
 
-# 让 daily_update.py 可被项目外调用
-SKILLS_DIR = Path(__file__).parent / "skills"
-sys.path.insert(0, str(Path(__file__).parent))
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from skills.01-infra.astock-data-source.main import get_realtime_all, get_kline, SOURCE_FAIL_COUNT
-from skills.01-infra.astock-cache.main import kline_save, kline_stats
+import astock_runtime
+
+_ds = astock_runtime.load_py(ROOT / "skills/01-infra/astock-data-source/main.py", "daily_update_ds")
+_cache = astock_runtime.load_py(ROOT / "skills/01-infra/astock-cache/main.py", "daily_update_cache")
+get_realtime_all = _ds.get_realtime_all
+get_kline = _ds.get_kline
+kline_save = _cache.kline_save
+kline_stats = _cache.kline_stats
 
 
-def get_all_codes():
-    """拿全市场股票代码"""
-    print("📡 拉取全市场代码列表...")
-    df = get_realtime_all()
+def get_all_codes(limit: int):
+    """拿一页行情里的代码。limit 是请求条数，不是全市场认定。"""
+    print(f"拉取一页行情代码，最多 {limit} 只（不是全市场普查）...")
+    df = get_realtime_all(num=limit, timeout=12)
     if df is None or df.empty:
-        print("❌ 拉取失败, 检查数据源")
+        print("拉取失败。未改用其他清单填充。")
         return []
-    code_col = "代码" if "代码" in df.columns else df.columns[0]
-    codes = df[code_col].astype(str).str.zfill(6).tolist()
-    print(f"✅ 拿到 {len(codes)} 只股票")
+    if "code" not in df.columns:
+        print("返回里没有 code 列。")
+        return []
+    codes = df["code"].astype(str).str.zfill(6).tolist()
+    print(
+        f"拿到 {len(codes)} 只；universe_complete={df.attrs.get('universe_complete')}"
+    )
     return codes
 
 
@@ -59,7 +69,9 @@ def main():
     parser = argparse.ArgumentParser(description="每日 K 线缓存更新")
     parser.add_argument("--codes", help="指定股票代码,逗号分隔")
     parser.add_argument("--days", type=int, default=60, help="K 线天数 (默认 60)")
-    parser.add_argument("--workers", type=int, default=1, help="并发数 (默认 1, 稳)")
+    parser.add_argument("--workers", type=int, default=1, help="保留参数。实际仍逐只更新")
+    parser.add_argument("--max-codes", type=int, default=None,
+                        help="未指定 --codes 时，从一页行情最多取多少只")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -68,13 +80,21 @@ def main():
     print("=" * 60)
 
     if args.codes:
-        codes = [c.strip().zfill(6) for c in args.codes.split(",")]
+        codes = [c.strip().zfill(6) for c in args.codes.split(",") if c.strip()]
+        if args.max_codes is not None:
+            codes = codes[:args.max_codes]
+    elif args.max_codes is None:
+        print("UNBOUNDED_REFUSED: 请传 --codes 或 --max-codes。不会默认下载全市场 K 线。")
+        return 2
+    elif args.max_codes < 1 or args.max_codes > 50:
+        print("--max-codes 必须在 1 到 50 之间。")
+        return 2
     else:
-        codes = get_all_codes()
+        codes = get_all_codes(args.max_codes)
 
     if not codes:
-        print("❌ 没有股票代码, 退出")
-        return
+        print("没有股票代码, 退出")
+        return 1
 
     print(f"🔄 开始更新 {len(codes)} 只股票 K 线...")
     start = time.time()
@@ -98,8 +118,9 @@ def main():
     elapsed = time.time() - start
     print("=" * 60)
     print(f"✅ 完成! 成功 {success} / 失败 {fail}  耗时 {elapsed/60:.1f} 分钟")
-    print(f"📦 缓存统计: {kline_stats()}")
+    print(f"缓存统计: {kline_stats()}")
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
