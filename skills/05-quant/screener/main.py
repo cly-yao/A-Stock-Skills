@@ -322,12 +322,10 @@ def _needs_change(where: Optional[str], column: str, frame: pd.DataFrame) -> boo
 
 
 def _fetch_kline_frame(code: str, days: int, timeout: float) -> pd.DataFrame:
-    import requests
-    response = requests.get(
+    response = astock_runtime.http_get(
         astock_runtime.IFZQ_URL,
         params={"param": f"{astock_runtime.sina_symbol(code)},day,,,{int(days)},qfq"},
         timeout=timeout,
-        proxies={"http": None, "https": None},
         headers={"User-Agent": "Mozilla/5.0"},
     )
     response.raise_for_status()
@@ -424,15 +422,13 @@ def _fetch_live_quotes(scope: Optional[List[str]], universe_limit: int, timeout:
         except Exception as exc:
             meta["errors"].append(f"eastmoney_ulist: {exc}")
             symbols = ",".join(astock_runtime.sina_symbol(code) for code in scope)
-            import requests
-            response = requests.get(
+            response = astock_runtime.http_get(
                 astock_runtime.SINA_HQ_URL + symbols,
                 timeout=timeout,
-                proxies={"http": None, "https": None},
+                encoding="gb18030",
                 headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
             )
             response.raise_for_status()
-            response.encoding = "gb18030"
             rows = astock_runtime.parse_sina_hq_batch(response.text)
             frame = pd.DataFrame(rows)
             got = set(frame["code"].tolist()) if not frame.empty else set()

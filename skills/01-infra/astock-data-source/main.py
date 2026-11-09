@@ -72,7 +72,10 @@ MAX_FAILS_BEFORE_SWITCH = 3
 
 # 修复 akshare 内部 requests 代理问题
 def _patch_akshare_proxy():
-    """Monkey patch akshare 内部 requests, 关闭代理"""
+    """Point akshare's requests calls away from ambient HTTP proxies.
+
+    Certificate verification is left untouched. Do not set verify to False.
+    """
     try:
         import requests
         original_get = requests.get
@@ -80,12 +83,10 @@ def _patch_akshare_proxy():
 
         def patched_get(url, **kwargs):
             kwargs["proxies"] = {"http": None, "https": None}
-            kwargs["verify"] = False
             return original_get(url, **kwargs)
 
         def patched_post(url, **kwargs):
             kwargs["proxies"] = {"http": None, "https": None}
-            kwargs["verify"] = False
             return original_post(url, **kwargs)
 
         requests.get = patched_get
@@ -103,10 +104,9 @@ _patch_akshare_proxy()
 def _get_quote_ifzq(code: str) -> Optional[Dict]:
     """腾讯 ifzq gtimg - 最稳定的源"""
     try:
-        import requests
         market = "sh" if str(code).startswith(("60", "68", "9")) else "sz"
         url = f"http://ifzq.gtimg.cn/appstock/app/fqkline/get?param={market}{code},day,,,60,qfq"
-        resp = requests.get(url, timeout=5, proxies={"http": None, "https": None})
+        resp = astock_runtime.http_get(url, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") == 0:
@@ -134,10 +134,9 @@ def _get_quote_ifzq(code: str) -> Optional[Dict]:
 def _get_quote_sina(code: str) -> Optional[Dict]:
     """新浪 hq.sinajs.cn"""
     try:
-        import requests
         market = "sh" if str(code).startswith(("60", "68", "9")) else "sz"
         url = f"https://hq.sinajs.cn/list={market}{code}"
-        resp = requests.get(url, timeout=5, proxies={"http": None, "https": None})
+        resp = astock_runtime.http_get(url, timeout=5, encoding="gb18030")
         resp.raise_for_status()
         text = resp.text
         # 解析: var hq_str_sh601991="大秦铁路,27.90,27.20,..."
@@ -166,15 +165,13 @@ def _get_quote_sina(code: str) -> Optional[Dict]:
 def _get_quote_eastmoney(code: str) -> Optional[Dict]:
     """东财 push2 (经常被封, 仅作备用)"""
     try:
-        import requests
         secid = f"1.{code}" if str(code).startswith(("60", "68", "9")) else f"0.{code}"
         url = "https://push2.eastmoney.com/api/qt/stock/get"
         params = {
             "secid": secid,
             "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170,f171",
         }
-        resp = requests.get(url, params=params, timeout=5,
-                            proxies={"http": None, "https": None})
+        resp = astock_runtime.http_get(url, params=params, timeout=5)
         resp.raise_for_status()
         d = resp.json().get("data")
         if not d:
@@ -242,7 +239,6 @@ def _fetch_sina_market_center(num: int = 80, timeout: float = 12.0) -> pd.DataFr
     if timeout <= 0:
         raise ValueError("timeout 必须 > 0")
     try:
-        import requests
         params = {
             "node": "hs_a",
             "sort": "changepercent",
@@ -250,11 +246,10 @@ def _fetch_sina_market_center(num: int = 80, timeout: float = 12.0) -> pd.DataFr
             "page": 1,
             "num": num,
         }
-        resp = requests.get(
+        resp = astock_runtime.http_get(
             astock_runtime.SINA_MC_URL,
             params=params,
             timeout=timeout,
-            proxies={"http": None, "https": None},
             headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
         )
         resp.raise_for_status()
@@ -292,8 +287,7 @@ def get_quotes_for_codes(codes: List[str], timeout: float = 8.0) -> pd.DataFrame
         raise ValueError("单次最多请求 50 只，请分批。未自动翻页。")
     secids = ",".join(astock_runtime.em_secid(c) for c in wanted)
     try:
-        import requests
-        resp = requests.get(
+        resp = astock_runtime.http_get(
             astock_runtime.EM_ULIST_URL,
             params={
                 "fltt": "2",
@@ -303,7 +297,6 @@ def get_quotes_for_codes(codes: List[str], timeout: float = 8.0) -> pd.DataFrame
                 "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             },
             timeout=float(timeout),
-            proxies={"http": None, "https": None},
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
         )
         resp.raise_for_status()
@@ -329,10 +322,9 @@ def get_quotes_for_codes(codes: List[str], timeout: float = 8.0) -> pd.DataFrame
 def get_kline_ifzq(code: str, days: int = 60) -> pd.DataFrame:
     """从 ifzq gtimg 获取 K 线 (稳定)"""
     try:
-        import requests
         market = "sh" if str(code).startswith(("60", "68", "9")) else "sz"
         url = f"http://ifzq.gtimg.cn/appstock/app/fqkline/get?param={market}{code},day,,,{days},qfq"
-        resp = requests.get(url, timeout=10, proxies={"http": None, "https": None})
+        resp = astock_runtime.http_get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 0:

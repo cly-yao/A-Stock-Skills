@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import ssl
 import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -65,19 +67,54 @@ class BudgetExceeded(RuntimeError):
     """Raised when another HTTP call would pass the call budget."""
 
 
+def tls_verify():
+    """CA bundle for requests. This never disables certificate checks.
+
+    ``Session.trust_env`` is off so proxy variables are ignored, which also
+    skips requests' own CA-bundle environment lookup. Resolve the bundle here:
+    an existing ``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE``,
+    then certifi, then the OpenSSL default file, then ``True``.
+    """
+    for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        candidate = os.environ.get(key)
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    try:
+        import certifi
+        bundle = certifi.where()
+        if bundle and os.path.isfile(bundle):
+            return bundle
+    except Exception:
+        pass
+    cafile = ssl.get_default_verify_paths().cafile
+    if cafile and os.path.isfile(cafile):
+        return cafile
+    return True
+
+
+def _require_verify(verify):
+    if verify is False or verify is None:
+        raise RuntimeError("TLS 证书校验不能关闭")
+    if isinstance(verify, str) and not os.path.isfile(verify):
+        raise RuntimeError(f"CA 证书包不存在: {verify}")
+    return verify
+
+
 class HttpBudget:
     """One short timeout per call, and a hard cap on how many calls run."""
 
-    def __init__(self, max_calls: int = 6, timeout: float = 8.0):
+    def __init__(self, max_calls: int = 6, timeout: float = 8.0, verify=None):
         if max_calls < 1:
             raise ValueError("max_calls 必须 >= 1")
         if timeout <= 0:
             raise ValueError("timeout 必须 > 0")
         self.max_calls = int(max_calls)
         self.timeout = float(timeout)
+        self.verify = _require_verify(tls_verify() if verify is None else verify)
         self.calls: list[dict] = []
         self._session = requests.Session()
         self._session.trust_env = False
+        self._session.verify = self.verify
 
     def request(
         self,
@@ -107,7 +144,7 @@ class HttpBudget:
                 params=params,
                 headers=headers or DEFAULT_HEADERS,
                 timeout=self.timeout,
-                verify=False,
+                verify=self.verify,
                 proxies={"http": None, "https": None},
             )
             rec["status"] = response.status_code
@@ -122,6 +159,22 @@ class HttpBudget:
         finally:
             rec["elapsed_sec"] = round(time.time() - started, 3)
             self.calls.append(rec)
+
+
+def http_get(url, *, params=None, headers=None, timeout=8, encoding=None):
+    """GET with certificate verification left on. TLS errors propagate."""
+    verify = _require_verify(tls_verify())
+    response = requests.get(
+        url,
+        params=params,
+        headers=headers,
+        timeout=timeout,
+        verify=verify,
+        proxies={"http": None, "https": None},
+    )
+    if encoding:
+        response.encoding = encoding
+    return response
 
 
 def repo_root_from(start: Path) -> Path:

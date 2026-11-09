@@ -202,12 +202,10 @@ def get_realtime_quotes(codes: List[str], source_cookie: Optional[str] = None) -
 def get_volume_ratio(code: str):
     """当日成交量 / 此前 5 根均量。失败时返回 None，不返回 1。"""
     try:
-        import requests
-        response = requests.get(
+        response = astock_runtime.http_get(
             astock_runtime.IFZQ_URL,
             params={"param": f"{astock_runtime.sina_symbol(code)},day,,,10,qfq"},
             timeout=8,
-            proxies={"http": None, "https": None},
             headers={"User-Agent": "Mozilla/5.0"},
         )
         response.raise_for_status()
