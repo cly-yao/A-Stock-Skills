@@ -81,6 +81,20 @@ def _route(url, params):
     if "fflow" in url:
         assert params["lmt"] == "5"
         return FakeResponse(payload={"data": {"klines": ["2020-01-02,1000,1"]}})
+    if "NewsBulletin/PageAjax" in url:
+        assert params["code"] == "SH600519"
+        return FakeResponse(payload={
+            "gszx": {"data": {"items": [{
+                "title": "郎酒汪俊林：不应出现在贵州茅台公告里",
+                "url": "http://finance.eastmoney.com/a/unrelated.html",
+                "code": "202611093925753412",
+            }]}},
+            "gsgg": [{
+                "art_code": "AN202611021831320924",
+                "notice_date": "2026-11-03 00:00:00",
+                "title": "贵州茅台:贵州茅台关于召开2026年第三季度业绩说明会的公告",
+            }],
+        })
     if "search/jsonp" in url:
         return FakeResponse(text='cb({"hitsTotal":1,"result":{"cmsArticleWebOld":[{"title":"合成标题","date":"2020-01-01","mediaName":"测试","url":"http://example.test"}]}})')
     raise AssertionError(url)
@@ -135,6 +149,40 @@ def test_stock_report_uses_one_quote_and_computes_ma_from_fixture_bars():
     assert technical["rows"][0]["ma5"] == pytest.approx(18)
     assert technical["rows"][0]["ma20"] == pytest.approx(10.5)
     assert "stock_zh_a_spot" not in text
+    news = next(section for section in built["sections"] if section["id"] == "news")
+    assert news["status"] == "ok"
+    assert news["source"] == "eastmoney_f10_bulletin"
+    assert news["rows"][0]["url"] == (
+        "https://data.eastmoney.com/notices/detail/600519/AN202611021831320924.html"
+    )
+    assert "郎酒" not in text
+    assert report._exit_code(built) == 0
+
+
+def test_keyword_news_stays_partial_and_drops_unscoped_items():
+    def route(url, params):
+        if "NewsBulletin/PageAjax" in url:
+            return FakeResponse(payload={
+                "gszx": {"data": {"items": [{"title": "郎酒汪俊林：无关行业稿", "url": "http://example.test/unrelated"}]}},
+                "gsgg": [],
+            })
+        if "search/jsonp" in url:
+            return FakeResponse(text=(
+                'cb({"hitsTotal":2,"result":{"cmsArticleWebOld":['
+                '{"title":"代码被点名的市场综述","date":"2026-11-01","url":"http://example.test/keyword"}'
+                ']}})'
+            ))
+        return _route(url, params)
+
+    built = report.build_stock_report(
+        "600519", transport=FakeTransport(route, max_calls=8), provenance="synthetic"
+    )
+    news = next(section for section in built["sections"] if section["id"] == "news")
+    text = report.render_markdown(built)
+    assert news["status"] == "partial"
+    assert news["source"] == "eastmoney_keyword_search"
+    assert "郎酒" not in text
+    assert "代码被点名的市场综述" in text
     assert report._exit_code(built) == 3
 
 
@@ -148,7 +196,7 @@ def test_failed_sections_do_not_render_zero_prices():
         "600519", transport=FakeTransport(empty, max_calls=8), provenance="synthetic"
     )
     text = report.render_markdown(built)
-    assert all(section["status"] == "failed" for section in built["sections"])
+    assert all(section["status"] in {"failed", "skipped"} for section in built["sections"])
     assert "现价:" not in text
     assert "0.00" not in text
     assert report._exit_code(built) == 1

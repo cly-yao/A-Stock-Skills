@@ -567,6 +567,29 @@ def _section_flow(transport, code: str):
 
 def _section_news(transport, code: str):
     def run():
+        errors = []
+        try:
+            response = _call(
+                transport,
+                astock_runtime.EM_F10_BULLETIN_URL,
+                params={"code": astock_runtime.em_f10_code(code)},
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://emweb.securities.eastmoney.com/"},
+            )
+            filings = astock_runtime.parse_f10_bulletins(response.json(), code)[:5]
+            if filings:
+                return _section(
+                    "news", "公司公告", "ok", source="eastmoney_f10_bulletin", rows=filings,
+                    note=(
+                        f"东财 F10 公告列表，请求 code={astock_runtime.em_f10_code(code)}。"
+                        "只采用 gsgg。同一响应的 gszx 资讯不按股票代码过滤，已丢弃。"
+                        "详情链接为 data.eastmoney.com/notices/detail/{代码}/{art_code}.html。"
+                    ),
+                )
+            errors.append("eastmoney_f10_bulletin: gsgg 没有可用公告")
+        except astock_runtime.BudgetExceeded:
+            raise
+        except Exception as exc:
+            errors.append(f"eastmoney_f10_bulletin: {type(exc).__name__}: {exc}")
         param = {
             "uid": "",
             "keyword": code,
@@ -585,31 +608,46 @@ def _section_news(transport, code: str):
                 }
             },
         }
-        response = _call(
-            transport,
-            astock_runtime.EM_NEWS_URL,
-            params={"cb": "cb", "param": json.dumps(param, ensure_ascii=False)},
-        )
-        payload = astock_runtime.parse_jsonp(response.text)
-        articles = (((payload or {}).get("result") or {}).get("cmsArticleWebOld")) or []
-        rows = []
-        for article in articles[:5]:
-            rows.append({
-                "title": article.get("title"),
-                "date": article.get("date"),
-                "media": article.get("mediaName"),
-                "url": article.get("url"),
-            })
-        if not rows:
-            return _section("news", "舆情", "failed", source="eastmoney_keyword_search",
-                            error="关键词搜索没有标题")
+        try:
+            response = _call(
+                transport,
+                astock_runtime.EM_NEWS_URL,
+                params={"cb": "cb", "param": json.dumps(param, ensure_ascii=False)},
+            )
+            payload = astock_runtime.parse_jsonp(response.text)
+            articles = (((payload or {}).get("result") or {}).get("cmsArticleWebOld")) or []
+            rows = []
+            for article in articles[:5]:
+                title = article.get("title")
+                if not title:
+                    continue
+                rows.append({
+                    "title": title,
+                    "date": article.get("date"),
+                    "media": article.get("mediaName"),
+                    "url": article.get("url"),
+                })
+            if not rows:
+                errors.append("eastmoney_keyword_search: 没有标题")
+            else:
+                return _section(
+                    "news", "舆情", "partial", source="eastmoney_keyword_search", rows=rows,
+                    note=(
+                        "公司公告列表不可用，退回代码关键词搜索。这不是该公司公告，"
+                        "标题可能只是在正文里提到代码。未把该结果标成 ok。"
+                        f" hitsTotal={payload.get('hitsTotal')}。"
+                    ),
+                    error=" | ".join(errors),
+                    extra={"hits_total": payload.get("hitsTotal"), "attempt_errors": errors},
+                )
+        except astock_runtime.BudgetExceeded:
+            raise
+        except Exception as exc:
+            errors.append(f"eastmoney_keyword_search: {type(exc).__name__}: {exc}")
         return _section(
-            "news", "舆情", "partial", source="eastmoney_keyword_search", rows=rows,
-            note=(
-                "这是代码关键词搜索命中，不是公司公告，标题可能只是在正文里提到代码。"
-                f"hitsTotal={payload.get('hitsTotal')}。未核验正文。"
-            ),
-            extra={"hits_total": payload.get("hitsTotal")},
+            "news", "舆情", "failed", source=None,
+            error=" | ".join(errors),
+            note="没有公司公告，也没有关键词标题。未编造新闻。",
         )
     return _guard("news", "舆情", run)
 
@@ -848,7 +886,9 @@ def _render_section(section: dict) -> str:
         lines.append("")
         for row in rows:
             title = row.get("title") or "-"
-            lines.append(f"- {row.get('date') or '-'} {title}")
+            url = row.get("url")
+            suffix = f" {url}" if url else ""
+            lines.append(f"- {row.get('date') or '-'} {title}{suffix}")
     elif section["id"] == "portfolio" and rows:
         lines.extend(["", "| 代码 | 名称 | 状态 | 现价 | 盈亏 | 收益率 |", "|------|------|------|------|------|--------|"])
         total_mv = total_cost = 0.0

@@ -50,6 +50,7 @@ SINA_KLINE_URL = (
 )
 TENCENT_QT_URL = "https://qt.gtimg.cn/q="
 TENCENT_FLOW_URL = "https://proxy.finance.qq.com/cgi/cgi-bin/fundflow/hsfundtab"
+EM_F10_BULLETIN_URL = "https://emweb.securities.eastmoney.com/PC_HSF10/NewsBulletin/PageAjax"
 
 # Sina mktcap / nmc are 万元. Screener strategies treat total_mv as 亿元.
 SINA_MV_WAN_TO_YI = 10000.0
@@ -445,6 +446,57 @@ def parse_tencent_quotes(text: str, include_fundamentals: bool = True) -> list[d
             row["circ_mv"] = to_float(parts[45]) if len(parts) > 45 else None
             row["total_mv_conversion"] = "tencent field 44 (亿元); pe is field 52, not field 39"
         rows.append(row)
+    return rows
+
+
+def em_f10_code(code: str) -> str:
+    """Eastmoney F10 prefix. SH for 60/68/9, otherwise SZ. BJ is not specially mapped."""
+    code = normalize_code(code)
+    prefix = "SH" if code.startswith(("60", "68", "9")) else "SZ"
+    return prefix + code
+
+
+def bulletin_detail_url(code: str, art_code: str) -> Optional[str]:
+    """Public notice page. Checked for 600519 / AN202611021831320924 on 2026-11-09."""
+    code = normalize_code(code)
+    if not re.fullmatch(r"AN\d+", str(art_code or "")):
+        return None
+    return f"https://data.eastmoney.com/notices/detail/{code}/{art_code}.html"
+
+
+def parse_f10_bulletins(payload, code: str) -> list[dict]:
+    """Company filings from F10 ``gsgg`` only.
+
+    ``gszx`` on the same response is not symbol-filtered (a SH600519 request
+    included an unrelated industry brief) and is ignored.
+    """
+    if not isinstance(payload, dict):
+        return []
+    filings = payload.get("gsgg")
+    if not isinstance(filings, list):
+        return []
+    code = normalize_code(code)
+    rows = []
+    for item in filings:
+        if not isinstance(item, dict):
+            continue
+        art_code = str(item.get("art_code") or "")
+        url = bulletin_detail_url(code, art_code)
+        title = item.get("title")
+        notice_date = item.get("notice_date")
+        if not url or not title or not notice_date:
+            continue
+        date_text = str(notice_date)
+        if len(date_text) >= 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text[:10]):
+            date_text = date_text[:10]
+        rows.append({
+            "title": title,
+            "date": date_text,
+            "url": url,
+            "art_code": art_code,
+            "requested_code": code,
+            "source": "eastmoney_f10_bulletin",
+        })
     return rows
 
 
