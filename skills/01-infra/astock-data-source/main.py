@@ -33,8 +33,22 @@ import time
 import argparse
 import logging
 from functools import wraps
+from pathlib import Path
 from typing import Optional, Dict, List, Any
 import pandas as pd
+
+def _bootstrap_repo() -> None:
+    here = Path(__file__).resolve()
+    for candidate in here.parents:
+        if (candidate / "astock_runtime.py").is_file() and (candidate / "skills").is_dir():
+            entry = str(candidate)
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+            return
+    raise RuntimeError("找不到 astock_runtime.py")
+
+_bootstrap_repo()
+import astock_runtime
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -216,41 +230,100 @@ def get_realtime_quote(code: str) -> Dict:
     raise RuntimeError(f"所有数据源均失败获取 {code}, 请检查网络")
 
 
-def get_realtime_all() -> pd.DataFrame:
-    """获取全 A 股实时行情 (用新浪 Market Center, 已知稳定)"""
+def _fetch_sina_market_center(num: int = 80, timeout: float = 12.0) -> pd.DataFrame:
+    """One Sina Market_Center page. Not a certified full-market census.
+
+    ``num`` is the page size sent to Sina. The returned frame is labeled
+    incomplete because this endpoint does not provide a reliable universe total.
+    ``total_mv`` is 亿元 (Sina ``mktcap`` is 万元).
+    """
+    num = max(1, min(int(num), 5000))
+    timeout = float(timeout)
+    if timeout <= 0:
+        raise ValueError("timeout 必须 > 0")
     try:
         import requests
-        url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-        params = {"node": "hs_a", "sort": "changepercent", "asc": 0, "num": 5000}
-        resp = requests.get(url, params=params, timeout=30,
-                            proxies={"http": None, "https": None})
+        params = {
+            "node": "hs_a",
+            "sort": "changepercent",
+            "asc": 0,
+            "page": 1,
+            "num": num,
+        }
+        resp = requests.get(
+            astock_runtime.SINA_MC_URL,
+            params=params,
+            timeout=timeout,
+            proxies={"http": None, "https": None},
+            headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
+        )
         resp.raise_for_status()
         data = resp.json()
-        if not data:
-            return pd.DataFrame()
-        df = pd.DataFrame(data)
-        # 标准化列名
-        col_map = {
-            "code": "code", "name": "name", "open": "open", "high": "high",
-            "low": "low", "trade": "price", "settlement": "pre_close",
-            "volume": "volume", "amount": "amount", "changepercent": "pct_change",
-            "mktcap": "total_mv", "nmc": "circ_mv", "turnoverratio": "turnover", "pe": "pe",
-        }
-        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-        # 数值类型
-        for col in ["price", "open", "high", "low", "pre_close", "pct_change", "turnover", "pe"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        # 单位转换: amount 元 -> 亿
-        if "amount" in df.columns:
-            df["amount_yi"] = df["amount"] / 1e8
-        if "total_mv" in df.columns:
-            df["total_mv_yi"] = df["total_mv"] / 1e8
-        if "circ_mv" in df.columns:
-            df["circ_mv_yi"] = df["circ_mv"] / 1e8
+    except Exception as exc:
+        raise RuntimeError(f"新浪行情页失败: {exc}") from exc
+    if not isinstance(data, list):
+        raise RuntimeError("新浪行情页返回的不是列表，未改写成空表冒充成功")
+    rows = astock_runtime.normalize_sina_market_rows(data)
+    df = pd.DataFrame(rows)
+    if not df.empty and "amount" in df.columns:
+        df["amount_yi"] = df["amount"] / 1e8
+    if not df.empty and "total_mv" in df.columns:
+        df["total_mv_yi"] = df["total_mv"]
+    if not df.empty and "circ_mv" in df.columns:
+        df["circ_mv_yi"] = df["circ_mv"]
+    df.attrs["provenance"] = astock_runtime.PROVENANCE_LIVE
+    df.attrs["source"] = "sina_market_center"
+    df.attrs["requested_num"] = num
+    df.attrs["returned"] = int(len(df))
+    df.attrs["universe_complete"] = False
+    df.attrs["note"] = "单页快照，不是全市场普查。total_mv 单位为亿元（mktcap 万元/10000）。"
+    return df
+
+
+def get_quotes_for_codes(codes: List[str], timeout: float = 8.0) -> pd.DataFrame:
+    """One Eastmoney ulist call for the given codes. Missing codes stay missing."""
+    wanted = [astock_runtime.normalize_code(c) for c in codes]
+    if not wanted:
+        df = pd.DataFrame()
+        df.attrs["provenance"] = astock_runtime.PROVENANCE_LIVE
+        df.attrs["missing"] = []
         return df
-    except Exception as e:
-        raise RuntimeError(f"新浪全市场接口失败: {e}")
+    if len(wanted) > 50:
+        raise ValueError("单次最多请求 50 只，请分批。未自动翻页。")
+    secids = ",".join(astock_runtime.em_secid(c) for c in wanted)
+    try:
+        import requests
+        resp = requests.get(
+            astock_runtime.EM_ULIST_URL,
+            params={
+                "fltt": "2",
+                "invt": "2",
+                "fields": "f12,f14,f2,f3,f6,f8,f9,f20,f21,f23",
+                "secids": secids,
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            },
+            timeout=float(timeout),
+            proxies={"http": None, "https": None},
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"东财个股批量行情失败: {exc}") from exc
+    diff = ((payload or {}).get("data") or {}).get("diff") or []
+    if not isinstance(diff, list):
+        raise RuntimeError("东财 ulist diff 不是列表")
+    rows = astock_runtime.normalize_ulist_rows(diff)
+    df = pd.DataFrame(rows)
+    got = set(df["code"].tolist()) if not df.empty else set()
+    missing = [c for c in wanted if c not in got]
+    df.attrs["provenance"] = astock_runtime.PROVENANCE_LIVE
+    df.attrs["source"] = "eastmoney_ulist"
+    df.attrs["requested"] = wanted
+    df.attrs["missing"] = missing
+    df.attrs["universe_complete"] = not missing
+    df.attrs["note"] = "total_mv 单位为亿元（f20 元/1e8）。缺失代码未补价。"
+    return df
 
 
 def get_kline_ifzq(code: str, days: int = 60) -> pd.DataFrame:
@@ -324,9 +397,9 @@ def get_realtime(code: str) -> Dict:
 
 
 @with_rate_limit(1.0)
-def get_realtime_all() -> pd.DataFrame:
-    """全 A 股实时行情"""
-    return get_realtime_all()
+def get_realtime_all(num: int = 80, timeout: float = 12.0) -> pd.DataFrame:
+    """Sina 行情页。默认 80 只，避免把单次调用变成全市场下载。"""
+    return _fetch_sina_market_center(num=num, timeout=timeout)
 
 
 @with_rate_limit(1.0)
@@ -452,7 +525,9 @@ def main():
     p.add_argument("--code", required=True, help="股票代码")
 
     # get-realtime-all
-    subparsers.add_parser("get-realtime-all", help="全 A 股实时")
+    p = subparsers.add_parser("get-realtime-all", help="新浪行情页（默认 80 只，非全市场）")
+    p.add_argument("--num", type=int, default=80, help="请求条数，1-5000，仍只打一页")
+    p.add_argument("--timeout", type=float, default=12.0)
 
     # get-kline
     p = subparsers.add_parser("get-kline", help="K 线")
@@ -502,9 +577,17 @@ def main():
             result = get_realtime(args.code)
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         elif args.command == "get-realtime-all":
-            df = get_realtime_all()
+            df = get_realtime_all(num=args.num, timeout=args.timeout)
+            print(json.dumps({
+                "provenance": df.attrs.get("provenance"),
+                "source": df.attrs.get("source"),
+                "requested_num": df.attrs.get("requested_num"),
+                "returned": df.attrs.get("returned"),
+                "universe_complete": df.attrs.get("universe_complete"),
+                "note": df.attrs.get("note"),
+            }, ensure_ascii=False))
             if not df.empty:
-                cols = ["code", "name", "price", "pct_change", "total_mv_yi", "amount_yi"]
+                cols = ["code", "name", "price", "pct_change", "pe", "total_mv", "amount_yi"]
                 cols = [c for c in cols if c in df.columns]
                 print(df[cols].head(50).to_string())
         elif args.command == "get-kline":
@@ -540,10 +623,14 @@ def main():
                     print(f"  ❌ {name}: {e}")
             # 全市场
             try:
-                df = get_realtime_all()
-                print(f"  ✅ sina 全市场: {len(df)} 只")
+                df = get_realtime_all(num=5, timeout=8)
+                print(
+                    f"  ✅ sina 行情页样本: {len(df)} 只 "
+                    f"(请求 {df.attrs.get('requested_num')}, universe_complete="
+                    f"{df.attrs.get('universe_complete')})"
+                )
             except Exception as e:
-                print(f"  ❌ sina 全市场: {e}")
+                print(f"  ❌ sina 行情页: {e}")
     except Exception as e:
         print(f"错误: {e}", file=sys.stderr)
         sys.exit(1)

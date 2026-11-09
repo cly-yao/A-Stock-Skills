@@ -1,0 +1,12 @@
+{
+  "provenance": "synthetic",
+  "fixture_id": "screener-universe-v1",
+  "note": "Hand-written rows for regression. These are not market quotes and must never be labeled live.",
+  "rows": [
+    {"code": "600519", "name": "合成茅台", "price": 100, "pe": 15, "pb": 5, "total_mv": 18000, "pct_change": 1.2, "turnover": 0.2},
+    {"code": "000001", "name": "合成银行", "price": 10, "pe": 5, "pb": 0.5, "total_mv": 2000, "pct_change": -0.3, "turnover": 0.4},
+    {"code": "300750", "name": "合成高市盈", "price": 20, "pe": 80, "pb": 8, "total_mv": 9000, "pct_change": 2.0, "turnover": 1.1},
+    {"code": "000002", "name": "ST合成", "price": 3, "pe": 8, "pb": 0.4, "total_mv": 100, "pct_change": 0.1, "turnover": 0.1},
+    {"code": "002001", "name": "合成小市值", "price": 4, "pe": 9, "pb": 1.0, "total_mv": 10, "pct_change": 0.2, "turnover": 0.2}
+  ]
+}

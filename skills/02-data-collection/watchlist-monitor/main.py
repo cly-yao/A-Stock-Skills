@@ -8,8 +8,17 @@ import json
 import time
 import argparse
 import pandas as pd
+from pathlib import Path
 from typing import List, Dict, Optional
 from datetime import datetime
+
+for _candidate in Path(__file__).resolve().parents:
+    if (_candidate / "astock_runtime.py").is_file() and (_candidate / "skills").is_dir():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
+
+import astock_runtime
 
 
 # ============================================================
@@ -120,69 +129,98 @@ alerts:
 # ============================================================
 # 数据获取
 # ============================================================
+def _missing_quote(code: str, error: str) -> Dict:
+    return {
+        "code": code,
+        "name": "",
+        "price": None,
+        "pct_change": None,
+        "found": False,
+        "error": error,
+    }
+
+
+def _fetch_quote_frame(codes: List[str]):
+    """One Eastmoney batch. Tests can replace this; it must not page the whole market."""
+    module = astock_runtime.load_py(
+        Path(astock_runtime.repo_root_from(Path(__file__))) / "skills/01-infra/astock-data-source/main.py",
+        "watchlist_data_source",
+    )
+    return module.get_quotes_for_codes(codes, timeout=8)
+
+
 def get_realtime_quotes(codes: List[str], source_cookie: Optional[str] = None) -> List[Dict]:
-    """批量获取实时行情"""
-    quotes = []
+    """批量获取实时行情。最多 50 只，一次请求。找不到的代码不填 0。"""
+    normalized = []
+    for code in codes:
+        try:
+            normalized.append(astock_runtime.normalize_code(code))
+        except ValueError:
+            normalized.append(str(code))
+    if source_cookie:
+        print("cookie 行情源未实现，未改用全市场接口。", file=sys.stderr)
+        return [_missing_quote(code, "cookie source not implemented") for code in normalized]
+    if len(normalized) > 50:
+        print("超过 50 只，拒绝拉取。未改用全市场分页接口。", file=sys.stderr)
+        return [_missing_quote(code, "code list exceeds 50") for code in normalized]
     try:
-        import akshare as ak
-        df = ak.stock_zh_a_spot_em()
-        if df.empty:
-            return quotes
-        df["代码"] = df["代码"].astype(str)
-        for code in codes:
-            code = str(code).zfill(6)
-            target = df[df["代码"] == code]
-            if target.empty:
-                quotes.append({
-                    "code": code, "name": "", "price": 0, "pct_change": 0,
-                    "found": False,
-                })
-                continue
-            row = target.iloc[0]
-            quotes.append({
-                "code": code,
-                "name": row.get("名称", ""),
-                "price": float(row.get("最新价", 0)),
-                "change": float(row.get("涨跌额", 0)),
-                "pct_change": float(row.get("涨跌幅", 0)),
-                "open": float(row.get("今开", 0)),
-                "high": float(row.get("最高", 0)),
-                "low": float(row.get("最低", 0)),
-                "pre_close": float(row.get("昨收", 0)),
-                "volume": float(row.get("成交量", 0)),
-                "amount": float(row.get("成交额", 0)),
-                "turnover": float(row.get("换手率", 0)),
-                "pe": row.get("市盈率-动态"),
-                "pb": row.get("市净率"),
-                "total_mv": float(row.get("总市值", 0)),
-                "circ_mv": float(row.get("流通市值", 0)),
-                "found": True,
-            })
-    except Exception as e:
-        print(f"获取行情失败: {e}", file=sys.stderr)
+        frame = _fetch_quote_frame(normalized)
+    except Exception as exc:
+        print(f"获取行情失败: {exc}", file=sys.stderr)
+        return [_missing_quote(code, f"{type(exc).__name__}: {exc}") for code in normalized]
+    by_code = {}
+    if frame is not None and not frame.empty:
+        by_code = {str(row["code"]).zfill(6): row for _, row in frame.iterrows()}
+    quotes = []
+    for code in normalized:
+        row = by_code.get(code)
+        if row is None or row.get("price") is None or pd.isna(row.get("price")):
+            quotes.append(_missing_quote(code, "quote missing"))
+            continue
+        total_yi = row.get("total_mv")
+        circ_yi = row.get("circ_mv")
+        quotes.append({
+            "code": code,
+            "name": row.get("name") or "",
+            "price": float(row["price"]),
+            "pct_change": None if row.get("pct_change") is None or pd.isna(row.get("pct_change")) else float(row["pct_change"]),
+            "amount": None if row.get("amount") is None or pd.isna(row.get("amount")) else float(row["amount"]),
+            "turnover": None if row.get("turnover") is None or pd.isna(row.get("turnover")) else float(row["turnover"]),
+            "pe": None if row.get("pe") is None or pd.isna(row.get("pe")) else float(row["pe"]),
+            "pb": None if row.get("pb") is None or pd.isna(row.get("pb")) else float(row["pb"]),
+            # 旧字段 total_mv 按元保留；亿元写在 total_mv_yi，避免把单位换了却不说明。
+            "total_mv": None if total_yi is None or pd.isna(total_yi) else float(total_yi) * 1e8,
+            "total_mv_yi": None if total_yi is None or pd.isna(total_yi) else float(total_yi),
+            "circ_mv": None if circ_yi is None or pd.isna(circ_yi) else float(circ_yi) * 1e8,
+            "total_mv_unit": "total_mv 为元，total_mv_yi 为亿元",
+            "source": row.get("source"),
+            "found": True,
+        })
     return quotes
 
 
-def get_volume_ratio(code: str) -> float:
-    """获取量比 (简化: 当日成交量/5日均量)"""
+def get_volume_ratio(code: str):
+    """当日成交量 / 此前 5 根均量。失败时返回 None，不返回 1。"""
     try:
-        import akshare as ak
-        from datetime import datetime, timedelta
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=20)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=str(code).zfill(6), period="daily",
-                                 start_date=start, end_date=end, adjust="qfq")
-        if df.empty or len(df) < 6:
-            return 1.0
-        df.columns = [c.lower() for c in df.columns]
-        if "volume" in df.columns:
-            today_vol = float(df["volume"].iloc[-1])
-            avg_5 = float(df["volume"].tail(5).mean())
-            if avg_5 > 0:
-                return round(today_vol / avg_5, 2)
-        return 1.0
+        import requests
+        response = requests.get(
+            astock_runtime.IFZQ_URL,
+            params={"param": f"{astock_runtime.sina_symbol(code)},day,,,10,qfq"},
+            timeout=8,
+            proxies={"http": None, "https": None},
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        rows = astock_runtime.parse_ifzq_kline(response.json(), code)
+        volumes = [row["volume"] for row in rows if row.get("volume") is not None]
+        if len(volumes) < 6 or volumes[-6:-1] and sum(volumes[-6:-1]) == 0:
+            return None
+        base = sum(volumes[-6:-1]) / 5
+        if base == 0:
+            return None
+        return round(volumes[-1] / base, 2)
     except Exception:
-        return 1.0
+        return None
 
 
 # ============================================================
@@ -197,41 +235,41 @@ def check_alerts(quotes: List[Dict], alerts: Dict, stock_configs: List[Dict]) ->
         if not q.get("found"):
             continue
         code = q["code"]
-        price = q.get("price", 0)
-        pct = q.get("pct_change", 0)
+        price = q.get("price")
+        pct = q.get("pct_change")
 
         # 涨幅告警
-        if "pct_change_up" in alerts and pct >= alerts["pct_change_up"]:
+        if pct is not None and "pct_change_up" in alerts and pct >= alerts["pct_change_up"]:
             triggered.append({
                 "code": code, "name": q["name"], "type": "pct_change_up",
                 "value": pct, "message": f"涨幅 {pct:+.2f}%, 超过阈值 {alerts['pct_change_up']}%"
             })
         # 跌幅告警
-        if "pct_change_down" in alerts and pct <= alerts["pct_change_down"]:
+        if pct is not None and "pct_change_down" in alerts and pct <= alerts["pct_change_down"]:
             triggered.append({
                 "code": code, "name": q["name"], "type": "pct_change_down",
                 "value": pct, "message": f"跌幅 {pct:+.2f}%, 超过阈值 {alerts['pct_change_down']}%"
             })
         # 价格上限
-        if "price_above" in alerts and price >= alerts["price_above"]:
+        if price is not None and "price_above" in alerts and price >= alerts["price_above"]:
             triggered.append({
                 "code": code, "name": q["name"], "type": "price_above",
                 "value": price, "message": f"价格 {price}, 突破 {alerts['price_above']}"
             })
         # 价格下限
-        if "price_below" in alerts and price <= alerts["price_below"]:
+        if price is not None and "price_below" in alerts and price <= alerts["price_below"]:
             triggered.append({
                 "code": code, "name": q["name"], "type": "price_below",
                 "value": price, "message": f"价格 {price}, 跌破 {alerts['price_below']}"
             })
         # 涨停
-        if alerts.get("limit_up") and pct >= 9.9:
+        if pct is not None and alerts.get("limit_up") and pct >= 9.9:
             triggered.append({
                 "code": code, "name": q["name"], "type": "limit_up",
                 "value": pct, "message": f"涨停! +{pct:.2f}%"
             })
         # 跌停
-        if alerts.get("limit_down") and pct <= -9.9:
+        if pct is not None and alerts.get("limit_down") and pct <= -9.9:
             triggered.append({
                 "code": code, "name": q["name"], "type": "limit_down",
                 "value": pct, "message": f"跌停! {pct:.2f}%"
@@ -252,15 +290,16 @@ def print_quotes(quotes: List[Dict], stock_configs: List[Dict]):
         if not q.get("found"):
             print(f"❌ {q['code']:<8} 未找到")
             continue
-        pct = q.get("pct_change", 0)
-        icon = "🔺" if pct > 0 else "🔻" if pct < 0 else "➖"
+        pct = q.get("pct_change")
+        icon = "➖" if pct is None else "🔺" if pct > 0 else "🔻" if pct < 0 else "➖"
+        pct_text = "   -  " if pct is None else f"{pct:+6.2f}%"
         cost_str = ""
         cfg = cost_map.get(q["code"])
-        if cfg and "cost" in cfg:
+        if cfg and cfg.get("cost") not in (None, 0) and q.get("price") is not None:
             profit = (q["price"] - cfg["cost"]) * cfg.get("shares", 0)
             profit_pct = (q["price"] - cfg["cost"]) / cfg["cost"] * 100
             cost_str = f"  盈亏: {profit:+,.0f} ({profit_pct:+.2f}%)"
-        print(f"{icon} {q['code']:<6} {q['name']:<8} {q['price']:>8.2f}  {pct:+6.2f}%{cost_str}")
+        print(f"{icon} {q['code']:<6} {q['name']:<8} {q['price']:>8.2f}  {pct_text}{cost_str}")
     print("=" * 70)
 
 
