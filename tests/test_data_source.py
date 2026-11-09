@@ -25,6 +25,32 @@ def test_recorded_sina_row_converts_mktcap_wan_to_yi():
     assert rows[0]["source"] == "sina_market_center"
 
 
+def test_get_realtime_uses_ulist_quote_not_a_stale_value(monkeypatch):
+    module = load("skills/01-infra/astock-data-source/main.py", "data_source_quote_under_test")
+    frame = __import__("pandas").DataFrame([{
+        "code": "600519",
+        "name": "贵州茅台",
+        "price": 10.5,
+        "pe": 21.0,
+        "source": "eastmoney_ulist",
+    }])
+    frame.attrs["source"] = "eastmoney_ulist"
+
+    def quotes(codes, timeout=8):
+        assert codes == ["600519"]
+        return frame
+
+    def boom(*args, **kwargs):
+        raise AssertionError("tencent/ifzq should not run when ulist has a price")
+
+    monkeypatch.setattr(module, "get_quotes_for_codes", quotes)
+    monkeypatch.setattr(module.astock_runtime, "http_get", boom)
+    quote = module.get_realtime_quote("600519")
+    assert quote["price"] == 10.5
+    assert quote["pe"] == 21.0
+    assert quote["source"] == "eastmoney_ulist"
+
+
 def test_get_realtime_all_makes_one_call(monkeypatch):
     module = load("skills/01-infra/astock-data-source/main.py", "data_source_under_test")
     calls = []

@@ -159,6 +159,46 @@ def test_stock_report_uses_one_quote_and_computes_ma_from_fixture_bars():
     assert report._exit_code(built) == 0
 
 
+def test_unknown_adjust_is_not_a_qfq_result():
+    def route(url, params):
+        if "fqkline" in url:
+            raise RuntimeError("HTTP 501")
+        if "kline/get" in url:
+            assert params["fqt"] == "1"
+            return FakeResponse(payload={"data": {"klines": []}})
+        if "CN_MarketData.getKLineData" in url:
+            raise AssertionError("sina unknown-adjust kline must not be requested for qfq")
+        return _route(url, params)
+
+    built = report.build_stock_report(
+        "600519", transport=FakeTransport(route, max_calls=8), provenance="synthetic"
+    )
+    technical = next(section for section in built["sections"] if section["id"] == "technical")
+    assert technical["status"] == "failed"
+    assert technical["rows"] == []
+    assert "qfq" in (technical.get("note") or "")
+    assert report._exit_code(built) == 1
+
+
+def test_eastmoney_fqt1_is_accepted_as_qfq_when_ifzq_fails():
+    def route(url, params):
+        if "fqkline" in url:
+            raise RuntimeError("HTTP 501")
+        if "kline/get" in url:
+            assert params["fqt"] == "1"
+            lines = [f"2020-01-{day:02d},{day},{day+1},{day+2},{max(day-1,1)},100" for day in range(1, 21)]
+            return FakeResponse(payload={"data": {"klines": lines}})
+        return _route(url, params)
+
+    built = report.build_stock_report(
+        "600519", transport=FakeTransport(route, max_calls=8), provenance="synthetic"
+    )
+    technical = next(section for section in built["sections"] if section["id"] == "technical")
+    assert technical["status"] == "ok"
+    assert technical["source"] == "eastmoney_kline"
+    assert technical["rows"][0]["adjust"] == "qfq"
+
+
 def test_keyword_news_stays_partial_and_drops_unscoped_items():
     def route(url, params):
         if "NewsBulletin/PageAjax" in url:

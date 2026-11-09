@@ -42,6 +42,7 @@ EM_CLIST_URL_ALT = "https://82.push2.eastmoney.com/api/qt/clist/get"
 EM_FENBU_URL = "https://push2ex.eastmoney.com/getTopicZDFenBu"
 EM_ZT_URL = "https://push2ex.eastmoney.com/getTopicZTPool"
 EM_FFLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 EM_NEWS_URL = "https://search-api-web.eastmoney.com/search/jsonp"
 IFZQ_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 SINA_KLINE_URL = (
@@ -496,6 +497,41 @@ def parse_f10_bulletins(payload, code: str) -> list[dict]:
             "art_code": art_code,
             "requested_code": code,
             "source": "eastmoney_f10_bulletin",
+        })
+    return rows
+
+
+def parse_eastmoney_kline(payload, code: str, fqt: str) -> list[dict]:
+    """Eastmoney daily kline. fqt 0/1/2 is raw/qfq/hfq. Other values are rejected."""
+    adjust = {"0": "raw", "1": "qfq", "2": "hfq"}.get(str(fqt))
+    if adjust is None or not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    klines = data.get("klines")
+    if not isinstance(klines, list):
+        return []
+    code = normalize_code(code)
+    rows = []
+    for line in klines:
+        parts = str(line).split(",")
+        if len(parts) < 6:
+            continue
+        close = to_float(parts[2])
+        if close is None or not parts[0]:
+            continue
+        rows.append({
+            "date": parts[0],
+            "open": to_float(parts[1]),
+            "close": close,
+            "high": to_float(parts[3]),
+            "low": to_float(parts[4]),
+            "volume": to_float(parts[5]),
+            "source": "eastmoney_kline",
+            "adjust": adjust,
+            "fqt": str(fqt),
+            "code": code,
         })
     return rows
 

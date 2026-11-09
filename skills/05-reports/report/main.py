@@ -407,7 +407,8 @@ def _section_quote(transport, code: str):
     return _guard("quote", "公司概况", run)
 
 
-def _bars_from_ifzq_or_sina(transport, code: str, days: int):
+def _qfq_bars(transport, code: str, days: int):
+    """Daily bars whose source contract is qfq. Unknown-adjust Sina bars are not used."""
     errors = []
     try:
         response = _call(
@@ -416,32 +417,49 @@ def _bars_from_ifzq_or_sina(transport, code: str, days: int):
             params={"param": f"{astock_runtime.sina_symbol(code)},day,,,{int(days)},qfq"},
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        rows = astock_runtime.parse_ifzq_kline(response.json(), code)
+        rows = [row for row in astock_runtime.parse_ifzq_kline(response.json(), code) if row.get("adjust") == "qfq"]
         if len(rows) >= 5:
             return rows, errors
-        errors.append(f"ifzq_gtimg: 只有 {len(rows)} 根")
+        errors.append(f"ifzq_gtimg: qfq 只有 {len(rows)} 根")
     except astock_runtime.BudgetExceeded:
         raise
     except Exception as exc:
         errors.append(f"ifzq_gtimg: {type(exc).__name__}: {exc}")
-    response = _call(
-        transport,
-        astock_runtime.SINA_KLINE_URL,
-        params={"symbol": astock_runtime.sina_symbol(code), "scale": "240", "ma": "no", "datalen": str(int(days))},
-        headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
-    )
-    rows = astock_runtime.parse_sina_kline(response.json(), code)
-    return rows, errors
+    try:
+        response = _call(
+            transport,
+            astock_runtime.EM_KLINE_URL,
+            params={
+                "secid": astock_runtime.em_secid(code),
+                "klt": "101",
+                "fqt": "1",
+                "lmt": str(int(days)),
+                "end": "20500101",
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56",
+            },
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+        )
+        rows = astock_runtime.parse_eastmoney_kline(response.json(), code, "1")
+        if len(rows) >= 5 and all(row.get("adjust") == "qfq" for row in rows):
+            return rows, errors
+        errors.append(f"eastmoney_kline: qfq 只有 {len(rows)} 根")
+    except astock_runtime.BudgetExceeded:
+        raise
+    except Exception as exc:
+        errors.append(f"eastmoney_kline: {type(exc).__name__}: {exc}")
+    errors.append("未使用新浪 K 线: 该接口不声明 qfq/raw，不能当作前复权")
+    return [], errors
 
 
 def _section_technical(transport, code: str, days: int = 60):
     def run():
-        rows, errors = _bars_from_ifzq_or_sina(transport, code, days)
-        if len(rows) < 5:
+        rows, errors = _qfq_bars(transport, code, days)
+        if len(rows) < 5 or any(row.get("adjust") != "qfq" for row in rows):
             return _section(
                 "technical", "技术面", "failed", source=None,
-                error=" | ".join(errors) or f"K 线只有 {len(rows)} 根",
-                note="ifzq 前复权失败或不足后，新浪 K 线也不足。未计算均线，未编造收盘价。",
+                error=" | ".join(errors) or "没有前复权 K 线",
+                note="请求的是前复权。ifzq qfqday 和东财 fqt=1 都没有给出足够的 qfq K 线。未用未知复权数据计算均线。",
             )
         closes = [row["close"] for row in rows if row.get("close") is not None]
         last = closes[-1]
@@ -456,14 +474,11 @@ def _section_technical(transport, code: str, days: int = 60):
             else:
                 trend = "震荡"
         adjust = rows[-1].get("adjust")
-        status = "ok" if ma20 is not None and adjust == "qfq" else "partial"
-        note = "均线只在样本够长时计算。"
-        if adjust == "qfq":
-            note = "ifzq qfqday，复权标记 qfq。最后一根日期是源里的交易日。"
-        elif adjust == "raw":
-            note = "ifzq 只返回了未复权 day，未把它标成 qfq。"
+        status = "ok" if ma20 is not None and adjust == "qfq" else "failed"
+        if rows[-1].get("source") == "eastmoney_kline":
+            note = "东财日 K，fqt=1，复权标记 qfq。ifzq qfq 未采用。"
         else:
-            note = "新浪 getKLineData 未声明复权方式，adjust=unknown，不把它标成 qfq。"
+            note = "ifzq qfqday，复权标记 qfq。最后一根日期是源里的交易日。"
         if errors:
             note += " 前序来源: " + " | ".join(errors)
         return _section(

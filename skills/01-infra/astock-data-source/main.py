@@ -202,11 +202,60 @@ SOURCE_FUNCS = [
 ]
 
 
-def get_realtime_quote(code: str) -> Dict:
-    """获取单只股票实时行情 - 多源 fallback"""
-    code = str(code).zfill(6)
+def _quote_from_row(row, source: str) -> Optional[Dict]:
+    price = row.get("price")
+    if price is None or (isinstance(price, float) and pd.isna(price)):
+        return None
+    quote = {"code": str(row.get("code")), "source": row.get("source") or source}
+    for key in (
+        "name", "price", "pct_change", "pe", "pb", "total_mv", "circ_mv",
+        "turnover", "amount", "as_of", "open", "high", "low", "pre_close", "change",
+    ):
+        if key not in row:
+            continue
+        value = row.get(key)
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            continue
+        quote[key] = value.item() if hasattr(value, "item") and not isinstance(value, (str, bytes)) else value
+    return quote
 
-    # 按优先级尝试各数据源
+
+def get_realtime_quote(code: str) -> Dict:
+    """Spot quote. Uses the same Eastmoney ulist and Tencent qt path as screener/report.
+
+    Does not reuse a cached price. ifzq/sina/push2 are tried only after those two miss.
+    """
+    code = str(code).zfill(6)
+    errors = []
+    try:
+        frame = get_quotes_for_codes([code], timeout=8)
+        if frame is not None and not frame.empty:
+            hit = frame[frame["code"].astype(str) == code]
+            if not hit.empty:
+                quote = _quote_from_row(hit.iloc[0], frame.attrs.get("source") or "eastmoney_ulist")
+                if quote:
+                    return quote
+        errors.append("eastmoney_ulist: 没有价格")
+    except Exception as exc:
+        errors.append(f"eastmoney_ulist: {type(exc).__name__}: {exc}")
+    try:
+        response = astock_runtime.http_get(
+            astock_runtime.TENCENT_QT_URL + astock_runtime.sina_symbol(code),
+            timeout=8,
+            encoding="gbk",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        matched = [
+            row for row in astock_runtime.parse_tencent_quotes(response.text)
+            if row.get("code") == code and row.get("price") is not None
+        ]
+        if matched:
+            return matched[0]
+        errors.append("tencent_qt: 没有价格")
+    except Exception as exc:
+        errors.append(f"tencent_qt: {type(exc).__name__}: {exc}")
+
     for source_name, func in SOURCE_FUNCS:
         try:
             result = func(code)
@@ -224,7 +273,8 @@ def get_realtime_quote(code: str) -> Dict:
         if SOURCE_FAIL_COUNT[source_name] >= MAX_FAILS_BEFORE_SWITCH:
             logger.warning(f"{source_name} 连续失败 {SOURCE_FAIL_COUNT[source_name]} 次, 暂时跳过")
 
-    raise RuntimeError(f"所有数据源均失败获取 {code}, 请检查网络")
+    detail = " | ".join(errors)
+    raise RuntimeError(f"所有数据源均失败获取 {code}" + (f": {detail}" if detail else ""))
 
 
 def _fetch_sina_market_center(num: int = 80, timeout: float = 12.0) -> pd.DataFrame:
